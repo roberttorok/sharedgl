@@ -41,7 +41,7 @@ struct ivshmem_mmap {
     WORD vectors;
 };
 
-static HANDLE ivshmem_handle;
+static HANDLE ivshmem_handle = INVALID_HANDLE_VALUE;
 #endif
 
 static void *ptr;
@@ -131,52 +131,85 @@ void pb_set(int fd, bool direct_access)
     }
 }
 #else
-void pb_set(bool direct_access)
+bool pb_set(bool direct_access)
 {
     HDEVINFO device_info;
-    PSP_DEVICE_INTERFACE_DETAIL_DATA inf_data;
+    PSP_DEVICE_INTERFACE_DETAIL_DATA_A inf_data;
     SP_DEVICE_INTERFACE_DATA dev_data;
     DWORD64 size;
     int fifo_size;
     struct ivshmem_mmap_config config;
     struct ivshmem_mmap map;
-    DWORD request_size;
+    DWORD request_size = 0;
+    DWORD returned = 0;
+    HANDLE handle;
 
-    device_info = SetupDiGetClassDevs(NULL, NULL, NULL, DIGCF_PRESENT | DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE);
+    /*
+     * SetupDiGetClassDevs(NULL, ..., DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE)
+     * finds nothing on Windows XP, so ask for the interface class directly.
+     */
+    device_info = SetupDiGetClassDevsA(&GUID_DEVINTERFACE_IVSHMEM, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+    if (device_info == INVALID_HANDLE_VALUE)
+        return false;
+
     ZeroMemory(&dev_data, sizeof(SP_DEVICE_INTERFACE_DATA));
     dev_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
-    if (SetupDiEnumDeviceInterfaces(device_info, NULL, &GUID_DEVINTERFACE_IVSHMEM, 0, &dev_data) == FALSE)
-        return;
+    if (SetupDiEnumDeviceInterfaces(device_info, NULL, &GUID_DEVINTERFACE_IVSHMEM, 0, &dev_data) == FALSE) {
+        SetupDiDestroyDeviceInfoList(device_info);
+        return false;
+    }
 
-    SetupDiGetDeviceInterfaceDetail(device_info, &dev_data, NULL, 0, &request_size, NULL);
-    if (!request_size)
-        return;
+    SetupDiGetDeviceInterfaceDetailA(device_info, &dev_data, NULL, 0, &request_size, NULL);
+    if (!request_size) {
+        SetupDiDestroyDeviceInfoList(device_info);
+        return false;
+    }
 
-    inf_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA)(malloc(request_size));
+    inf_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)malloc(request_size);
     ZeroMemory(inf_data, request_size);
-    inf_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA);
-    if (!SetupDiGetDeviceInterfaceDetail(device_info, &dev_data, inf_data, request_size, NULL, NULL))
-        return;
-    
-    ivshmem_handle = CreateFile(inf_data->DevicePath, 0, 0, NULL, OPEN_EXISTING, 0, 0);
-    if (ivshmem_handle == INVALID_HANDLE_VALUE)
-        return;
-
-    if (inf_data)
+    inf_data->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A);
+    if (!SetupDiGetDeviceInterfaceDetailA(device_info, &dev_data, inf_data, request_size, NULL, NULL)) {
         free(inf_data);
+        SetupDiDestroyDeviceInfoList(device_info);
+        return false;
+    }
+
+    handle = CreateFileA(inf_data->DevicePath, 0, 0, NULL, OPEN_EXISTING, 0, 0);
+    free(inf_data);
     SetupDiDestroyDeviceInfoList(device_info);
+    if (handle == INVALID_HANDLE_VALUE)
+        return false;
 
-    if (!DeviceIoControl(ivshmem_handle, IOCTL_IVSHMEM_REQUEST_SIZE, NULL, 0, &size, sizeof(UINT64), NULL, NULL))
-        return;
+    /* DeviceIoControl requires a bytes-returned pointer on Windows XP */
+    if (!DeviceIoControl(handle, IOCTL_IVSHMEM_REQUEST_SIZE, NULL, 0, &size, sizeof(UINT64), &returned, NULL)) {
+        CloseHandle(handle);
+        return false;
+    }
 
-    config.cache_mode = IVSHMEM_CACHE_WRITECOMBINED;
+    /*
+     * write-back: reads from write-combined memory are uncached, which makes
+     * every poll and framebuffer copy crawl.
+     */
+    config.cache_mode = IVSHMEM_CACHE_CACHED;
     ZeroMemory(&map, sizeof(struct ivshmem_mmap));
-    if (!DeviceIoControl(ivshmem_handle, IOCTL_IVSHMEM_REQUEST_MMAP, &config, sizeof(struct ivshmem_mmap_config), &map, sizeof(struct ivshmem_mmap), NULL, NULL))
-        return;
+    if (!DeviceIoControl(handle, IOCTL_IVSHMEM_REQUEST_MMAP, &config, sizeof(struct ivshmem_mmap_config), &map, sizeof(struct ivshmem_mmap), &returned, NULL)) {
+        CloseHandle(handle);
+        return false;
+    }
 
+    ivshmem_handle = handle;
     ptr = map.pointer;
-    base = (PVOID)((DWORD64)map.pointer + (DWORD64)SGL_STAGE_OFFSET);
+
+    /* the server publishes these at startup and clears them when it exits */
+    if (*(volatile uint64_t*)((char*)ptr + SGL_OFFSET_REGISTER_MEMSIZE) == 0 ||
+        *(volatile int*)((char*)ptr + SGL_OFFSET_REGISTER_FIFO_SIZE) <= 0) {
+        pb_unset();
+        ptr = NULL;
+        return false;
+    }
+
+    base = (PVOID)((uintptr_t)map.pointer + (uintptr_t)SGL_STAGE_OFFSET);
     fifo_size = *(int*)((char*)ptr + SGL_OFFSET_REGISTER_FIFO_SIZE);
     in_capacity = (size_t)fifo_size;
     using_direct_access = direct_access;
@@ -191,12 +224,18 @@ void pb_set(bool direct_access)
         in_base = VirtualAlloc(NULL, in_capacity, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
         in_cur = in_base;
     }
+    return in_base != NULL;
 }
 
 void pb_unset(void)
 {
-    DeviceIoControl(ivshmem_handle, IOCTL_IVSHMEM_RELEASE_MMAP, NULL, 0, NULL, 0, NULL, NULL);
+    DWORD returned = 0;
+
+    if (ivshmem_handle == INVALID_HANDLE_VALUE)
+        return;
+    DeviceIoControl(ivshmem_handle, IOCTL_IVSHMEM_RELEASE_MMAP, NULL, 0, NULL, 0, &returned, NULL);
     CloseHandle(ivshmem_handle);
+    ivshmem_handle = INVALID_HANDLE_VALUE;
 }
 #endif
 

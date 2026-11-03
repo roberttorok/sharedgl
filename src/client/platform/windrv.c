@@ -3,6 +3,7 @@
 #include <sharedgl.h>
 
 #include <windows.h>
+#include <mmsystem.h>
 #include <client/glimpl.h>
 #include <client/platform/gldrv.h>
 #include <client/platform/windrv.h>
@@ -11,6 +12,7 @@
 #include <client/pb.h>
 #include <client/spinlock.h>
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -128,7 +130,25 @@ struct windrv_context_state {
     DHGLRC handle;
     HDC hdc;
     INT layer_plane;
+    BOOL viewport_set;
 };
+
+#ifdef SGL_XP
+/* implemented with -mrtd in glimpl.c, which is stdcall */
+void APIENTRY glViewport(GLint x, GLint y, GLsizei width, GLsizei height);
+void APIENTRY glScissor(GLint x, GLint y, GLsizei width, GLsizei height);
+void APIENTRY glFlush(void);
+void APIENTRY glGetIntegerv(GLenum pname, GLint *params);
+void APIENTRY glPixelStorei(GLenum pname, GLint param);
+void APIENTRY glNewList(GLuint list, GLenum mode);
+void APIENTRY glEndList(void);
+void APIENTRY glBitmap(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLfloat xmove, GLfloat ymove, const GLubyte *bitmap);
+#ifndef GL_BGRA
+#define GL_BGRA 0x80E1
+#endif
+#define GL_COMPILE 0x1300
+#define GL_UNPACK_ALIGNMENT 0x0CF5
+#endif
 
 static HMODULE module_handle = 0;
 static BOOL do_vflip = TRUE;
@@ -436,8 +456,14 @@ static const char *wgl_extensions =
     "WGL_ARB_framebuffer_sRGB "
     "WGL_ARB_pixel_format";
 
+#ifdef SGL_XP
+#endif
+
 static HGLRC wgl_create_context(HDC hdc)
 {
+#ifdef SGL_XP
+    return wglCreateContext(hdc);
+#endif
     if (g_pfnwglCreateContext == NULL)
         g_pfnwglCreateContext = (wglCreateContext_t)GetProcAddress(GetModuleHandleA("opengl32.dll"), "wglCreateContext");
 
@@ -446,26 +472,29 @@ static HGLRC wgl_create_context(HDC hdc)
 
 static BOOL wgl_delete_context(HGLRC hglrc)
 {
+#ifdef SGL_XP
+    return wglDeleteContext(hglrc);
+#endif
     if (g_pfnwglDeleteContext == NULL)
         g_pfnwglDeleteContext = (wglDeleteContext_t)GetProcAddress(GetModuleHandleA("opengl32.dll"), "wglDeleteContext");
 
     return g_pfnwglDeleteContext(hglrc);
 }
 
-const char* wglGetExtensionsStringARB(HDC hdc)
+const char* WINAPI wglGetExtensionsStringARB(HDC hdc)
 {
     (void)hdc;
     return wgl_extensions;
 }
 
-HGLRC wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, const int *attribList)
+HGLRC WINAPI wglCreateContextAttribsARB(HDC hDC, HGLRC hShareContext, const int *attribList)
 {
     (void)hShareContext;
     (void)attribList;
     return wgl_create_context(hDC);
 }
 
-BOOL wglGetPixelFormatAttribivARB(HDC hdc,
+BOOL WINAPI wglGetPixelFormatAttribivARB(HDC hdc,
                                   int iPixelFormat,
                                   int iLayerPlane,
                                   UINT nAttributes,
@@ -487,7 +516,7 @@ BOOL wglGetPixelFormatAttribivARB(HDC hdc,
     return TRUE;
 }
 
-BOOL wglGetPixelFormatAttribfvARB(HDC hdc,
+BOOL WINAPI wglGetPixelFormatAttribfvARB(HDC hdc,
                                   int iPixelFormat,
                                   int iLayerPlane,
                                   UINT nAttributes,
@@ -511,7 +540,7 @@ BOOL wglGetPixelFormatAttribfvARB(HDC hdc,
     return TRUE;
 }
 
-BOOL wglChoosePixelFormatARB(HDC hdc,
+BOOL WINAPI wglChoosePixelFormatARB(HDC hdc,
                              const int *piAttribIList,
                              const FLOAT *pfAttribFList,
                              UINT nMaxFormats,
@@ -742,8 +771,15 @@ BOOL APIENTRY DrvRealizeLayerPalette(HDC hdc, INT iLayerPlane, BOOL bRealize)
     return FALSE;
 }
 
+#ifdef SGL_XP
+static BOOL xp_present(HDC hdc);
+#endif
+
 BOOL APIENTRY DrvSwapBuffers(HDC hdc)
 {
+#ifdef SGL_XP
+    return xp_present(hdc);
+#endif
     static BITMAPINFO bmi = {
         .bmiHeader.biSize = sizeof(BITMAPINFO),
         .bmiHeader.biPlanes = 1,
@@ -779,10 +815,12 @@ BOOL APIENTRY DrvSwapBuffers(HDC hdc)
     return TRUE;
 }
 
+#ifndef __MINGW32__
 BOOL APIENTRY DrvPresentBuffers(HDC hdc, LPPRESENTBUFFERS data)
 {
     return TRUE;
 }
+#endif
 
 BOOL APIENTRY DrvSwapLayerBuffers(HDC hdc, UINT fuPlanes)
 {
@@ -821,5 +859,9 @@ BOOL APIENTRY DrvSetPixelFormat(HDC hdc, LONG iPixelFormat)
 // {
 //     return TRUE;
 // }
+
+#ifdef SGL_XP
+#include "xpwgl.inl"
+#endif
 
 #endif

@@ -37,8 +37,8 @@ void SGL_INTERNAL pb_set_net(struct pb_net_hooks hooks, size_t internal_alloc_si
  */
 void SGL_INTERNAL pb_set(int pb, bool direct_access);
 #else
-void pb_set(bool direct_access);
-void pb_unset(void);
+bool SGL_INTERNAL pb_set(bool direct_access);
+void SGL_INTERNAL pb_unset(void);
 #endif
 
 void SGL_INTERNAL pb_reset();

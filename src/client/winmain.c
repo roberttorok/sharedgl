@@ -31,7 +31,15 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID reserved)
             windrv_set_vflip(FALSE);
 
         windrv_set_module_address(module);
+#ifdef SGL_XP
+        windrv_install_display_hook();
+#else
+        /*
+         * The XP build replaces opengl32.dll, so GDI loads it into processes
+         * that never draw. It connects in wglCreateContext instead.
+         */
         glimpl_init();
+#endif
     }
     if (reason == DLL_PROCESS_DETACH)
         glimpl_goodbye();

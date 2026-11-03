@@ -24,6 +24,17 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#ifdef SGL_XP
+#include <x86intrin.h> /* for __rdtsc; intrin.h conflicts with -mrtd on mingw-w64 13 */
+static int client_profile;
+void SGL_INTERNAL glimpl_profile_record(int index, unsigned long long cycles)
+{
+    if (client_profile) {
+        volatile unsigned long long *stats = pb_global_ptr(15 * 4096 + 1024);
+        stats[index] += cycles;
+    }
+}
+#endif
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -81,7 +92,11 @@
     GL_GET_MEMCPY_RETVAL_EX(pname, data, type)
 
 // #define STUB() fprintf(stderr, "%s: stub\n", __FUNCTION__);
+#ifdef SGL_XP
+#define STUB() glimpl_note_stub(__FUNCTION__)
+#else
 #define STUB()
+#endif
 
 enum gl_vertex_attrib_pointer_kind {
     GLIMPL_VERTEX_ATTRIB_POINTER_FLOAT,
@@ -420,6 +435,9 @@ bool expecting_retval = true;
 
 static inline void submit_shm()
 {
+#ifdef SGL_XP
+    unsigned long long prof_begin = __rdtsc();
+#endif
     size_t submit_size = pb_size();
     int fifo_size = pb_global_read(SGL_OFFSET_REGISTER_FIFO_SIZE);
 
@@ -470,6 +488,10 @@ static inline void submit_shm()
             spin_backoff(&backoff);
     }
     pb_reset();
+#ifdef SGL_XP
+    glimpl_profile_record(0, __rdtsc() - prof_begin);
+    glimpl_profile_record(1, 1);
+#endif
 }
 
 static inline void submit_net()
@@ -622,6 +644,8 @@ void * SGL_INTERNAL glimpl_fb_address()
     return pb_global_ptr((size_t)pb_global_read64(SGL_OFFSET_REGISTER_FBSTART));
 }
 
+static bool glimpl_shm_available = true;
+
 static inline void init_shm(bool use_direct_access)
 {
     glimpl_uses_network = false;
@@ -637,7 +661,10 @@ static inline void init_shm(bool use_direct_access)
 
     pb_set(fd, use_direct_access);
 #else
-    pb_set(use_direct_access);
+    if (!pb_set(use_direct_access)) {
+        glimpl_shm_available = false;
+        return;
+    }
 #endif
     pb_reset();
 }
@@ -795,6 +822,16 @@ void SGL_INTERNAL glimpl_init()
         init_shm(false);
     else
         init_net(network);
+
+#ifdef SGL_XP
+    client_profile = network == NULL && getenv("SGL_CLIENT_PROFILE") != NULL;
+    if (client_profile) memset(pb_global_ptr(15 * 4096 + 1024), 0, 64);
+#endif
+
+    if (!glimpl_shm_available) {
+        glimpl_shm_available = true;
+        return;
+    }
 
     glimpl_major = gl_version_override ? gl_version_override[0] - '0' : pb_read(SGL_OFFSET_REGISTER_GLMAJ);
     glimpl_minor = gl_version_override ? gl_version_override[2] - '0' : pb_read(SGL_OFFSET_REGISTER_GLMIN);

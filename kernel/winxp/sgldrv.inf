@@ -1,0 +1,44 @@
+; SharedGL shared-memory driver for Windows XP (32-bit)
+
+[Version]
+Signature="$Windows NT$"
+Class=System
+ClassGuid={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Vendor%
+DriverVer=11/01/2026,1.0.0.0
+
+[DestinationDirs]
+DefaultDestDir=12
+
+[SourceDisksNames]
+1=%DiskName%
+
+[SourceDisksFiles]
+sgldrv.sys=1
+
+[Manufacturer]
+%Vendor%=Standard
+
+[Standard]
+%DeviceDesc%=SglInstall,PCI\VEN_1AF4&DEV_1110
+
+[SglInstall.NT]
+CopyFiles=SglFiles
+
+[SglFiles]
+sgldrv.sys
+
+[SglInstall.NT.Services]
+AddService=sgldrv,0x00000002,SglService
+
+[SglService]
+DisplayName=%DeviceDesc%
+ServiceType=1
+StartType=3
+ErrorControl=1
+ServiceBinary=%12%\sgldrv.sys
+
+[Strings]
+Vendor="SharedGL"
+DiskName="SharedGL for Windows XP"
+DeviceDesc="SharedGL shared memory device"
