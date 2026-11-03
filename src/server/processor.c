@@ -350,6 +350,47 @@ char *net_get_ip()
     return ip_buffer;
 }
 
+/*
+ * Deleting a buffer sets the attributes using it to buffer 0, and their offset then reads as a raw address: an
+ * enabled one crashes the driver at the next draw. WineD3D can leave one enabled across a delete (3DMark's Pixel
+ * Shader test), and a program that does so never reads it. Give such attributes zeros to point at instead.
+ */
+static void sgl_detach_buffer_from_attribs(unsigned int buffer)
+{
+    static GLuint spare;
+    GLint previous = 0;
+    bool bound = false;
+
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &previous);
+    for (int i = 0; i < 16; i++) {
+        GLint enabled = 0, binding = 0, size = 0, type = 0, normalized = 0, stride = 0;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &enabled);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &binding);
+        if (!enabled || (unsigned int)binding != buffer)
+            continue;
+        if (!bound) {
+            /* Kept for good: deleting it would put the attributes back at buffer 0. */
+            if (!spare || !glIsBuffer(spare)) {
+                static char zeros[1 << 20];
+                glGenBuffers(1, &spare);
+                glBindBuffer(GL_ARRAY_BUFFER, spare);
+                glBufferData(GL_ARRAY_BUFFER, sizeof(zeros), zeros, GL_STATIC_DRAW);
+            }
+            else
+                glBindBuffer(GL_ARRAY_BUFFER, spare);
+            bound = true;
+            PRINT_LOG("buffer %u deleted while attribute %d is enabled: using zeros\n", buffer, i);
+        }
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_NORMALIZED, &normalized);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+        glVertexAttribPointer(i, size, type, normalized, stride, NULL);
+    }
+    if (bound)
+        glBindBuffer(GL_ARRAY_BUFFER, previous);
+}
+
 void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
 {
     int width, height;
@@ -658,6 +699,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 break;
             case SGL_CMD_DELETEBUFFERS: {
                 unsigned int buffer = *pb++;
+                sgl_detach_buffer_from_attribs(buffer);
                 glDeleteBuffers(1, &buffer);
                 break;
             }
