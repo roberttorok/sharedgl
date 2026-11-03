@@ -7,15 +7,40 @@
 #include <sgldebug.h>
 
 #define ENET_IMPLEMENTATION
+#ifdef _WIN32
+/* enet brings its own clock_gettime, which clashes with MinGW's. Keep it private to enet. */
+#define clock_gettime enet_clock_gettime
+#endif
 #include <network/enet.h>
+#ifdef _WIN32
+#undef clock_gettime
+#endif
 #include <network/packet.h>
 
 #include <stdbool.h>
+#include <time.h>
+#ifdef _WIN32
+#include <windows.h>
+#include <timeapi.h>
+/* Files for the debug aids; the launcher runs the server in its run folder. */
+#define SGL_RUNTIME_FILE(name) name
+#else
+#include <sys/prctl.h>
+#define SGL_RUNTIME_FILE(name) "/dev/shm/" name
+#endif
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <client/scratch.h>
+
+#ifdef _WIN32
+/* windows.h defines these, and the command handlers use near and far as variables. */
+#undef near
+#undef far
+#undef FORCEINLINE
+#define FORCEINLINE __attribute__((always_inline))
+#endif
 
 #if !(defined(__x86_64__) || defined(_M_X64) || defined(i386) || defined(__i386__) || defined(__i386) || defined(_M_IX86))
 #define _mm_pause() asm volatile("yield");
@@ -719,9 +744,9 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             case SGL_CMD_GETQUERYOBJECTUI64V: {
                 int id = *pb++,
                     pname = *pb++;
-                unsigned long res = 0;
+                GLuint64 res = 0; /* long is only 32 bits on Windows */
                 glGetQueryObjectui64v(id, pname, &res);
-                *(long*)(p + SGL_OFFSET_REGISTER_RETVAL) = res;
+                *(GLuint64*)(p + SGL_OFFSET_REGISTER_RETVAL) = res;
                 break;
             }
             case SGL_CMD_GETPROGRAMIV: {
@@ -6225,7 +6250,8 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             }
             if (!begun) {
                 int error;
-                while ((error = glGetError()) != GL_NO_ERROR)
+                /* With no current context, NVIDIA on Windows reports an error from glGetError forever. */
+                while (SDL_GL_GetCurrentContext() != NULL && (error = glGetError()) != GL_NO_ERROR)
                     PRINT_LOG("gl error (%d / 0x%04x) on client %d from %s (%d)\n", error, error, client_id, sgl_cmd2str(cmd), cmd);
             }
         }

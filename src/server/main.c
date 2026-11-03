@@ -12,8 +12,14 @@
 #include <fcntl.h>
 #include <signal.h>
 
+#ifdef _WIN32
+#include <windows.h>
+/* The QEMU device ivshmem-win opens this same name. */
+#define SGL_WIN32_MAPPING_NAME "Local\\" SGL_SHARED_MEMORY_NAME
+#else
 #include <sys/mman.h>
 #include <sys/stat.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -45,8 +51,13 @@ static void generate_virtual_machine_arguments(size_t m)
         "  <size unit=\"M\">%ld</size>\n"
         "</shmem>\n";
     
+#ifdef _WIN32
+    static const char *qemu_string =
+        "-device ivshmem-win,name=" SGL_WIN32_MAPPING_NAME ",size=%ldM\n";
+#else
     static const char *qemu_string =
         "-object memory-backend-file,size=%ldM,share,mem-path=/dev/shm/" SGL_SHARED_MEMORY_NAME ",id=" SGL_SHARED_MEMORY_NAME "\n";
+#endif
 
     fprintf(stderr, "\nlibvirt:\n");
     fprintf(stderr, libvirt_string, m);
@@ -57,22 +68,37 @@ static void generate_virtual_machine_arguments(size_t m)
 
 static void term_handler(int sig)
 {
+    /* a client that starts later must see that nobody is serving */
+#ifdef _WIN32
+    if (shm_ptr != NULL) {
+#else
+    if (shm_ptr != NULL && shm_ptr != MAP_FAILED) {
+#endif
+        *(uint64_t*)((char*)shm_ptr + SGL_OFFSET_REGISTER_MEMSIZE) = 0;
+        *(int*)((char*)shm_ptr + SGL_OFFSET_REGISTER_FIFO_SIZE) = 0;
+    }
+#ifndef _WIN32
     munmap(shm_ptr, shm_size);
+#endif
     int icmd = *internal_cmd_ptr;
 
     switch (sig) {
     case SIGINT:
+    case SIGTERM:
         break;
     case SIGSEGV:
         PRINT_LOG("server stopped! segmentation fault on %s (%d)\n", sgl_cmd2str(icmd), icmd);
         break;
+#ifndef _WIN32
     // shouldn't ever reach here
     case SIGPIPE:
         PRINT_LOG("server stopped! socket unexpectedly closed\n");
         break;
+#endif
     }
 
-    exit(1);
+    /* exit() would run the GL driver's cleanup, which can hang inside a signal handler */
+    _exit(1);
 }
 
 static void arg_parser_protector(int sig)
@@ -110,7 +136,9 @@ int main(int argc, char **argv)
             overlay_enable();
             break;
         case 'x':
+#ifndef _WIN32
             shm_unlink(SGL_SHARED_MEMORY_NAME);
+#endif
             PRINT_LOG("unlinked shared memory '%s'\n", SGL_SHARED_MEMORY_NAME);
             return 0;
         case 'g':
@@ -144,8 +172,11 @@ int main(int argc, char **argv)
     }
 
     signal(SIGINT, term_handler);
+    signal(SIGTERM, term_handler);
     signal(SIGSEGV, term_handler);
+#ifndef _WIN32
     signal(SIGPIPE, SIG_IGN);
+#endif
 
     PRINT_LOG("press CTRL+C to terminate server\n");
 
@@ -160,6 +191,23 @@ int main(int argc, char **argv)
      * allocate memory, only create a shared memory file if using shared memory
      */
     shm_size *= 1024 * 1024;
+#ifdef _WIN32
+    {
+        /* A mapping lives as long as a process holds it, so there is nothing to unlink. */
+        HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_COMMIT,
+            (DWORD)((unsigned long long)shm_size >> 32), (DWORD)shm_size,
+            network_over_shared ? NULL : SGL_WIN32_MAPPING_NAME);
+        if (mapping == NULL) {
+            PRINT_LOG("failed to create shared memory (error %lu)\n", GetLastError());
+            return -1;
+        }
+        shm_ptr = MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, shm_size);
+        if (shm_ptr == NULL) {
+            PRINT_LOG("failed to map shared memory (error %lu); is another size already open?\n", GetLastError());
+            return -2;
+        }
+    }
+#else
     if (!network_over_shared) {
         int shm_fd = shm_open(SGL_SHARED_MEMORY_NAME, O_CREAT | O_RDWR, S_IRWXU);
         if (shm_fd == -1) {
@@ -177,8 +225,9 @@ int main(int argc, char **argv)
     else {
         shm_ptr = mmap(NULL, shm_size, PROT_READ | PROT_WRITE, MAP_ANON | MAP_SHARED, -1, 0);
     }
+#endif
 
-    PRINT_LOG("reserved %ld MiB of memory\n", shm_size / 1024 / 1024);
+    PRINT_LOG("reserved %d MiB of memory\n", (int)(shm_size / 1024 / 1024));
 
     struct sgl_cmd_processor_args args = {
         .base_address = shm_ptr,

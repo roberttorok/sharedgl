@@ -3,6 +3,10 @@
 #include <server/context.h>
 #include <server/overlay.h>
 
+#ifdef _WIN32
+#include <epoxy/wgl.h>
+#endif
+
 static bool is_vid_init = false;
 static int mw = 1920;
 static int mh = 1080;
@@ -90,6 +94,12 @@ void sgl_set_current(struct sgl_host_context *ctx)
         SDL_GL_MakeCurrent(NULL, NULL);
     else
         SDL_GL_MakeCurrent(ctx->window, ctx->gl_context);
+
+#ifdef _WIN32
+    /* SDL switched the context behind epoxy's back; epoxy's pointers are per context here. */
+    if (ctx != NULL)
+        epoxy_handle_external_wglMakeCurrent();
+#endif
 
 #ifdef SGL_DEBUG_EMIT_FRAMES
     if (ctx)
