@@ -42,6 +42,9 @@ void SGL_INTERNAL glimpl_profile_record(int index, unsigned long long cycles)
 
 #define GLIMPL_RUNTIME_USES_SHARED_MEMORY (!glimpl_uses_network)
 
+/* array elements have consecutive locations; -1 means "inactive" and has to stay that */
+#define GLIMPL_ARRAY_LOCATION(location, i) ((location) < 0 ? (location) : (location) + (i))
+
 #define GLIMPL_MAX_OBJECTS 256
 #define GLIMPL_MAX_TEXTURES 8
 #define GLIMPL_MAX_COUNT_FOR_MATRIX_OP 256 // MSVC doesn't support VLAs
@@ -6717,49 +6720,49 @@ void glWindowPos3sv(const GLshort* v)
 void glUniform1fv(GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform1f(location, value[i * 1 + 0]);
+        glUniform1f(GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glUniform2fv(GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform2f(location, value[i * 2 + 0], value[i * 2 + 1]);
+        glUniform2f(GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glUniform3fv(GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform3f(location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glUniform3f(GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glUniform4fv(GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform4f(location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glUniform4f(GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glUniform1iv(GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform1i(location, value[i * 1 + 0]);
+        glUniform1i(GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glUniform2iv(GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform2i(location, value[i * 2 + 0], value[i * 2 + 1]);
+        glUniform2i(GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glUniform3iv(GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform3i(location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glUniform3i(GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glUniform4iv(GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform4i(location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glUniform4i(GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glVertexAttrib1dv(GLuint index, const GLdouble* v)
@@ -6870,25 +6873,25 @@ void glVertexAttribI4uiv(GLuint index, const GLuint* v)
 void glUniform1uiv(GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform1ui(location, value[i * 1 + 0]);
+        glUniform1ui(GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glUniform2uiv(GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform2ui(location, value[i * 2 + 0], value[i * 2 + 1]);
+        glUniform2ui(GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glUniform3uiv(GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform3ui(location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glUniform3ui(GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glUniform4uiv(GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform4ui(location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glUniform4ui(GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glVertexAttribP1uiv(GLuint index, GLenum type, GLboolean normalized, const GLuint* value)
@@ -6909,121 +6912,121 @@ void glMultiTexCoordP1uiv(GLenum texture, GLenum type, const GLuint* coords)
 void glUniform1dv(GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform1d(location, value[i * 1 + 0]);
+        glUniform1d(GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glUniform2dv(GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform2d(location, value[i * 2 + 0], value[i * 2 + 1]);
+        glUniform2d(GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glUniform3dv(GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform3d(location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glUniform3d(GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glUniform4dv(GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glUniform4d(location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glUniform4d(GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glProgramUniform1iv(GLuint program, GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform1i(program, location, value[i * 1 + 0]);
+        glProgramUniform1i(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glProgramUniform1fv(GLuint program, GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform1f(program, location, value[i * 1 + 0]);
+        glProgramUniform1f(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glProgramUniform1dv(GLuint program, GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform1d(program, location, value[i * 1 + 0]);
+        glProgramUniform1d(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glProgramUniform1uiv(GLuint program, GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform1ui(program, location, value[i * 1 + 0]);
+        glProgramUniform1ui(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 1 + 0]);
 }
 
 void glProgramUniform2iv(GLuint program, GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform2i(program, location, value[i * 2 + 0], value[i * 2 + 1]);
+        glProgramUniform2i(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glProgramUniform2fv(GLuint program, GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform2f(program, location, value[i * 2 + 0], value[i * 2 + 1]);
+        glProgramUniform2f(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glProgramUniform2dv(GLuint program, GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform2d(program, location, value[i * 2 + 0], value[i * 2 + 1]);
+        glProgramUniform2d(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glProgramUniform2uiv(GLuint program, GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform2ui(program, location, value[i * 2 + 0], value[i * 2 + 1]);
+        glProgramUniform2ui(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 2 + 0], value[i * 2 + 1]);
 }
 
 void glProgramUniform3iv(GLuint program, GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform3i(program, location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glProgramUniform3i(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glProgramUniform3fv(GLuint program, GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform3f(program, location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glProgramUniform3f(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glProgramUniform3dv(GLuint program, GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform3d(program, location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glProgramUniform3d(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glProgramUniform3uiv(GLuint program, GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform3ui(program, location, value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
+        glProgramUniform3ui(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 3 + 0], value[i * 3 + 1], value[i * 3 + 2]);
 }
 
 void glProgramUniform4iv(GLuint program, GLint location, GLsizei count, const GLint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform4i(program, location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glProgramUniform4i(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glProgramUniform4fv(GLuint program, GLint location, GLsizei count, const GLfloat* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform4f(program, location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glProgramUniform4f(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glProgramUniform4dv(GLuint program, GLint location, GLsizei count, const GLdouble* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform4d(program, location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glProgramUniform4d(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glProgramUniform4uiv(GLuint program, GLint location, GLsizei count, const GLuint* value)
 {
     for (int i = 0; i < count; i++)
-        glProgramUniform4ui(program, location, value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
+        glProgramUniform4ui(program, GLIMPL_ARRAY_LOCATION(location, i), value[i * 4 + 0], value[i * 4 + 1], value[i * 4 + 2], value[i * 4 + 3]);
 }
 
 void glVertexAttribL1dv(GLuint index, const GLdouble* v)
