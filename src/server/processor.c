@@ -351,6 +351,120 @@ char *net_get_ip()
 }
 
 /*
+ * Debugging aid: while /dev/shm/sgl_trace_frames holds a number, that many frames
+ * of commands, with up to 12 raw argument words each, go to /dev/shm/sgl_trace.log.
+ */
+static void sgl_report_shader(unsigned int shader)
+{
+    GLint ok = 0;
+    glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
+    if (!ok) {
+        static char log[4096], source[16384];
+        glGetShaderInfoLog(shader, sizeof(log), NULL, log);
+        glGetShaderSource(shader, sizeof(source), NULL, source);
+        PRINT_LOG("shader %u failed to compile:\n%s\n--- source ---\n%s\n---\n", shader, log, source);
+    }
+}
+
+static void sgl_report_program(unsigned int program)
+{
+    GLint ok = 0;
+    glGetProgramiv(program, GL_LINK_STATUS, &ok);
+    if (!ok) {
+        static char log[4096];
+        glGetProgramInfoLog(program, sizeof(log), NULL, log);
+        PRINT_LOG("program %u failed to link:\n%s\n", program, log);
+    }
+}
+
+/* SGL_SHADERDUMP: records each program just before linking, so a link that crashes the driver can be read afterwards. */
+static void sgl_dump_program(unsigned int program)
+{
+    static int enabled = -1;
+    static char source[65536];
+    unsigned int shaders[8];
+    int count = 0;
+    FILE *out;
+
+    if (enabled < 0)
+        enabled = getenv("SGL_SHADERDUMP") != NULL;
+    if (!enabled)
+        return;
+    out = fopen(SGL_RUNTIME_FILE("sgl_shaders.txt"), "a");
+    if (!out)
+        return;
+    glGetAttachedShaders(program, 8, &count, shaders);
+    fprintf(out, "=== link program %u, %d shaders\n", program, count);
+    for (int i = 0; i < count; i++) {
+        GLint ok = 0, type = 0;
+        source[0] = 0;
+        glGetShaderiv(shaders[i], GL_COMPILE_STATUS, &ok);
+        glGetShaderiv(shaders[i], GL_SHADER_TYPE, &type);
+        glGetShaderSource(shaders[i], sizeof(source), NULL, source);
+        fprintf(out, "--- shader %u type %x compiled %d\n%s\n", shaders[i], type, ok, source);
+    }
+    fclose(out);
+}
+
+/* SGL_DRAWCHECK: keeps a description of the vertex arrays used by the latest draw, which the crash handler prints. */
+char sgl_last_draw[4096];
+static void sgl_note_draw(const char *name, int mode, int first, int count)
+{
+    static int enabled = -1;
+    char *at = sgl_last_draw, *end = sgl_last_draw + sizeof(sgl_last_draw) - 128;
+    GLint value = 0, binding = 0, program = 0;
+    void *pointer = NULL;
+
+    if (enabled < 0)
+        enabled = getenv("SGL_DRAWCHECK") != NULL;
+    if (!enabled)
+        return;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &program);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING, &binding);
+    at += sprintf(at, "%s mode %x first %d count %d, program %d, array buffer %d\n", name, mode, first, count, program, binding);
+    for (int i = 0; i < 16 && at < end; i++) {
+        GLint size = 0, type = 0, stride = 0, divisor = 0;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_ENABLED, &value);
+        if (!value)
+            continue;
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_BUFFER_BINDING, &binding);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_SIZE, &size);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_TYPE, &type);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_STRIDE, &stride);
+        glGetVertexAttribiv(i, GL_VERTEX_ATTRIB_ARRAY_DIVISOR, &divisor);
+        glGetVertexAttribPointerv(i, GL_VERTEX_ATTRIB_ARRAY_POINTER, &pointer);
+        at += sprintf(at, "attrib %d: buffer %d pointer %p size %d type %x stride %d divisor %d\n", i, binding, pointer, size, type, stride, divisor);
+    }
+    {
+        static const struct { GLenum array, ptr, buf; const char *name; } legacy[] = {
+            { GL_VERTEX_ARRAY, GL_VERTEX_ARRAY_POINTER, GL_VERTEX_ARRAY_BUFFER_BINDING, "vertex" },
+            { GL_NORMAL_ARRAY, GL_NORMAL_ARRAY_POINTER, GL_NORMAL_ARRAY_BUFFER_BINDING, "normal" },
+            { GL_COLOR_ARRAY, GL_COLOR_ARRAY_POINTER, GL_COLOR_ARRAY_BUFFER_BINDING, "color" },
+            { GL_SECONDARY_COLOR_ARRAY, GL_SECONDARY_COLOR_ARRAY_POINTER, GL_SECONDARY_COLOR_ARRAY_BUFFER_BINDING, "secondary" },
+            { GL_FOG_COORD_ARRAY, GL_FOG_COORD_ARRAY_POINTER, GL_FOG_COORD_ARRAY_BUFFER_BINDING, "fog" },
+        };
+        GLint active = GL_TEXTURE0;
+        for (int i = 0; i < 5 && at < end; i++) {
+            if (!glIsEnabled(legacy[i].array))
+                continue;
+            glGetIntegerv(legacy[i].buf, &binding);
+            glGetPointerv(legacy[i].ptr, &pointer);
+            at += sprintf(at, "%s array: buffer %d pointer %p\n", legacy[i].name, binding, pointer);
+        }
+        glGetIntegerv(GL_CLIENT_ACTIVE_TEXTURE, &active);
+        for (int i = 0; i < 8 && at < end; i++) {
+            glClientActiveTexture(GL_TEXTURE0 + i);
+            if (!glIsEnabled(GL_TEXTURE_COORD_ARRAY))
+                continue;
+            glGetIntegerv(GL_TEXTURE_COORD_ARRAY_BUFFER_BINDING, &binding);
+            glGetPointerv(GL_TEXTURE_COORD_ARRAY_POINTER, &pointer);
+            at += sprintf(at, "texcoord %d array: buffer %d pointer %p\n", i, binding, pointer);
+        }
+        glClientActiveTexture(active);
+    }
+}
+
+/*
  * Deleting a buffer sets the attributes using it to buffer 0, and their offset then reads as a raw address: an
  * enabled one crashes the driver at the next draw. WineD3D can leave one enabled across a delete (3DMark's Pixel
  * Shader test), and a program that does so never reads it. Give such attributes zeros to point at instead.
@@ -391,8 +505,49 @@ static void sgl_detach_buffer_from_attribs(unsigned int buffer)
         glBindBuffer(GL_ARRAY_BUFFER, previous);
 }
 
+static void sgl_trace_command(int cmd, int *pb)
+{
+    static FILE *out;
+    static int frames_left, check_counter;
+
+    if (frames_left <= 0) {
+        if (cmd != SGL_CMD_SWAP_BUFFERS)
+            return;
+        if (++check_counter % 16 == 0) {
+            FILE *request = fopen(SGL_RUNTIME_FILE("sgl_trace_frames"), "r");
+            if (request != NULL) {
+                if (fscanf(request, "%d", &frames_left) != 1)
+                    frames_left = 0;
+                fclose(request);
+                remove(SGL_RUNTIME_FILE("sgl_trace_frames"));
+                out = fopen(SGL_RUNTIME_FILE("sgl_trace.log"), "w");
+            }
+        }
+        return;
+    }
+
+    if (cmd != SGL_CMD_VP_DOWNLOAD && cmd >= 0 && cmd < SGL_CMD_MAX) {
+        fprintf(out, "%s", sgl_cmd2str(cmd));
+        if (cmd != SGL_CMD_VP_UPLOAD)
+            for (int i = 1; i <= 12; i++)
+                fprintf(out, " %x", pb[i]);
+        else
+            fprintf(out, " words=%d", pb[1]);
+        fputc('\n', out);
+    }
+    if (cmd == SGL_CMD_SWAP_BUFFERS && --frames_left == 0) {
+        fclose(out);
+        out = NULL;
+    }
+}
+
 void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
 {
+    const bool profile = getenv("SGL_PROFILE") != NULL;
+    uint64_t prof_start = SDL_GetPerformanceCounter(), prof_mark = 0;
+    uint64_t prof_wait = 0, prof_context = 0, prof_errors = 0, prof_submits = 0;
+    uint64_t prof_commands[SGL_CMD_MAX] = {0}, prof_times[SGL_CMD_MAX] = {0};
+    const double prof_frequency = (double)SDL_GetPerformanceFrequency();
     int width, height;
     int cmd;
     bool network_expecting_retval = true;
@@ -475,6 +630,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
     }
 
     while (1) {
+        if (profile) prof_mark = SDL_GetPerformanceCounter();
         int client_id = 0;
         size_t submit_size = 0;
         struct sgl_host_context *net_ctx = NULL;
@@ -486,6 +642,13 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             wait_shm(shared, &client_id, &submit_size);
         else
             wait_net(shared, &client_id, &net_ctx, &peer, server, args, framebuffer_size, fifo_size, width, height);
+
+        if (profile) {
+            uint64_t now = SDL_GetPerformanceCounter();
+            prof_wait += now - prof_mark;
+            prof_mark = now;
+            prof_submits++;
+        }
 
         if (!args.network_over_shared) {
             if (!sgl_valid_client_id(client_id)) {
@@ -516,13 +679,17 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             connection_current(client_id);
         else
             sgl_set_current(net_ctx);
+
+        if (profile) prof_context += SDL_GetPerformanceCounter() - prof_mark;
         
         int *pb = (int*)(p + SGL_OFFSET_COMMAND_START);
         char *cmd_base = p + SGL_OFFSET_COMMAND_START;
         int release_client_slot = 0;
         // int track = 0;
         while (*pb != SGL_CMD_INVALID) {
+            if (profile) prof_mark = SDL_GetPerformanceCounter();
             cmd = *pb;
+            sgl_trace_command(cmd, pb);
             // printf("[%-5d] command: %s (%d)\n", track++, sgl_cmd2str(*pb), *pb); fflush(stdout);
             // if (*pb >= SGL_CMD_MAX)
             //    exit(1);
@@ -561,6 +728,50 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
 
                 void *framebuffer_target = (char*)shared + (*(uint64_t*)((char*)shared + SGL_OFFSET_REGISTER_FBSTART));
                 sgl_read_pixels(w, h, framebuffer_target, vflip, format, (size_t)pb - (size_t)cmd_base);
+                {
+                    /* the current frame rate, for anyone who wants to read it */
+                    static int swaps;
+                    static time_t last;
+                    time_t now = time(NULL);
+                    swaps++;
+                    if (now - last >= 5) {
+                        FILE *out = fopen(SGL_RUNTIME_FILE("sgl_fps"), "w");
+                        if (out != NULL) {
+                            fprintf(out, "%.1f\n", (double)swaps / (double)(now - last));
+                            fclose(out);
+                        }
+                        swaps = 0;
+                        last = now;
+                    }
+                }
+                {
+                    /* SGL_FRAMETIME: microseconds between swaps, one per line. Written in batches so logging doesn't disturb the timing. */
+                    static int enabled = -1;
+                    static uint64_t previous, last_write;
+                    static uint32_t times[4096];
+                    static int count;
+                    if (enabled < 0)
+                        enabled = getenv("SGL_FRAMETIME") != NULL;
+                    if (enabled) {
+                        uint64_t now = SDL_GetPerformanceCounter(), frequency = SDL_GetPerformanceFrequency();
+                        if (previous != 0 && count < 4096)
+                            times[count++] = (uint32_t)((now - previous) * 1000000 / frequency);
+                        previous = now;
+                        if (now - last_write >= 2 * frequency) {
+                            static int started;
+                            FILE *out = fopen(SGL_RUNTIME_FILE("sgl_frametime.log"), started ? "a" : "w");
+                            if (out != NULL) {
+                                for (int i = 0; i < count; i++)
+                                    fprintf(out, "%u\n", times[i]);
+                                fclose(out);
+                                started = 1;
+                            }
+                            count = 0;
+                            last_write = SDL_GetPerformanceCounter();
+                            previous = last_write;
+                        }
+                    }
+                }
                 network_did_swap_buffers = server != NULL;
                 break;
             }
@@ -702,7 +913,8 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 break;
             }
             case SGL_CMD_COMPILESHADER:
-                glCompileShader(*pb++);
+                glCompileShader(*pb);
+                sgl_report_shader(*pb++);
                 break;
             case SGL_CMD_CREATEPROGRAM:
                 *(int*)(p + SGL_OFFSET_REGISTER_RETVAL) = glCreateProgram();
@@ -755,6 +967,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int mode = *pb++,
                     first = *pb++,
                     count = *pb++;
+                sgl_note_draw("glDrawArrays", mode, first, count);
                 glDrawArrays(mode, first, count);
                 break;
             }
@@ -1001,7 +1214,9 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 break;
             }
             case SGL_CMD_LINKPROGRAM:
-                glLinkProgram(*pb++);
+                sgl_dump_program(*pb);
+                glLinkProgram(*pb);
+                sgl_report_program(*pb++);
                 break;
             case SGL_CMD_LOADIDENTITY:
                 glLoadIdentity();
@@ -6439,12 +6654,19 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 break;
             }
             }
+            if (profile && cmd >= 0 && cmd < SGL_CMD_MAX) {
+                uint64_t now = SDL_GetPerformanceCounter();
+                prof_commands[cmd]++;
+                prof_times[cmd] += now - prof_mark;
+                prof_mark = now;
+            }
             if (!begun) {
                 int error;
                 /* With no current context, NVIDIA on Windows reports an error from glGetError forever. */
                 while (SDL_GL_GetCurrentContext() != NULL && (error = glGetError()) != GL_NO_ERROR)
                     PRINT_LOG("gl error (%d / 0x%04x) on client %d from %s (%d)\n", error, error, client_id, sgl_cmd2str(cmd), cmd);
             }
+            if (profile) prof_errors += SDL_GetPerformanceCounter() - prof_mark;
         }
 
         /* 
@@ -6462,6 +6684,29 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             if (release_client_slot != 0) {
                 sgl_release_client_slot(shared, release_client_slot);
                 PRINT_LOG("shared-memory client left slot %d\n", release_client_slot);
+            }
+        }
+
+        if (profile) {
+            uint64_t now = SDL_GetPerformanceCounter();
+            double elapsed = (now - prof_start) / prof_frequency;
+            if (elapsed >= 5.0) {
+                FILE *out = fopen(SGL_RUNTIME_FILE("sgl_profile.txt"), "a");
+                if (out) {
+                    double ticks = (double)(now - prof_start);
+                    fprintf(out, "--- %.2fs submits/s=%.0f wait=%.1f%% context/copy=%.1f%% errors=%.1f%%\n",
+                        elapsed, prof_submits / elapsed, prof_wait * 100.0 / ticks,
+                        prof_context * 100.0 / ticks, prof_errors * 100.0 / ticks);
+                    for (int i = 0; i < SGL_CMD_MAX; i++)
+                        if (prof_commands[i])
+                            fprintf(out, " %5.1f%% %9.0f/s %s\n", prof_times[i] * 100.0 / ticks,
+                                prof_commands[i] / elapsed, sgl_cmd2str(i));
+                    fclose(out);
+                }
+                memset(prof_commands, 0, sizeof(prof_commands));
+                memset(prof_times, 0, sizeof(prof_times));
+                prof_wait = prof_context = prof_errors = prof_submits = 0;
+                prof_start = now;
             }
         }
 

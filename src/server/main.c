@@ -29,6 +29,8 @@ static size_t shm_size;
 
 static int *internal_cmd_ptr;
 
+extern char sgl_last_draw[];
+
 static const char *usage =
     "usage: sglrenderer [-h] [-v] [-o] [-n] [-x] [-g MAJOR.MINOR] [-r WIDTHxHEIGHT] [-m SIZE] [-p PORT]\n"
     "\n"
@@ -88,6 +90,8 @@ static void term_handler(int sig)
         break;
     case SIGSEGV:
         PRINT_LOG("server stopped! segmentation fault on %s (%d)\n", sgl_cmd2str(icmd), icmd);
+        if (sgl_last_draw[0])
+            fprintf(stderr, "last draw state:\n%s\n", sgl_last_draw);
         break;
 #ifndef _WIN32
     // shouldn't ever reach here
