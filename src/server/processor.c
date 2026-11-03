@@ -193,6 +193,8 @@ static FORCEINLINE inline int64_t pb_next_i64(int **pb)
 
 static FORCEINLINE inline void wait_shm(void *p, int *client_id, size_t *submit_size)
 {
+    int64_t idle_since_us = 0;
+
     /*
      * not only wait for a submit from a specific client,
      * but also ensure that the client we are waiting for
@@ -226,9 +228,32 @@ static FORCEINLINE inline void wait_shm(void *p, int *client_id, size_t *submit_
             break;
 
         /*
-         * some sort of "sync"
+         * Commands within a frame can arrive microseconds apart, so spin for a
+         * moment to keep those fast, then sleep. Spinning all the time costs a
+         * whole CPU core, even with no client connected.
          */
-        _mm_pause();
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        int64_t now_us = (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+        if (idle_since_us == 0)
+            idle_since_us = now_us;
+
+        int64_t idle_us = now_us - idle_since_us;
+        if (idle_us < 1000) {
+            _mm_pause();
+        }
+        else {
+#ifdef _WIN32
+            /* Windows cannot sleep for 50us: the shortest sleep is a whole timer tick. */
+            if (idle_us < 5000)
+                _mm_pause();
+            else
+                Sleep(1);
+#else
+            struct timespec nap = { 0, idle_us < 5000 ? 50000 : 1000000 };
+            nanosleep(&nap, NULL);
+#endif
+        }
     }
 
     *client_id = *(int*)((char*)p + SGL_OFFSET_REGISTER_STAGE_CLIENT_ID);
@@ -340,6 +365,13 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
     ENetHost *server;
     char *shared_exec = NULL;
     
+    /* short naps in wait_shm should really be short */
+#ifdef _WIN32
+    timeBeginPeriod(1);
+#else
+    prctl(PR_SET_TIMERSLACK, 1000UL);
+#endif
+
     sgl_get_max_resolution(&width, &height);
     size_t framebuffer_size = width * height * 4;
     size_t fifo_size = args.memory_size - SGL_STAGE_OFFSET - framebuffer_size;
