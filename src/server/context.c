@@ -113,12 +113,47 @@ void *sgl_read_pixels(unsigned int width, unsigned int height, void *data, int v
 
     overlay_stage1(&overlay_ctx);
 
-    glReadPixels(0, 0, mw, height, format, GL_UNSIGNED_BYTE, data); // GL_BGRA
+    /*
+     * The application's own state must not change where the frame comes from
+     * or how it is laid out in the shared framebuffer, whose stride is `mw`.
+     */
+    GLint read_fbo, read_buffer, pack_buffer, row_length, skip_rows, skip_pixels, alignment;
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read_fbo);
+    glGetIntegerv(GL_READ_BUFFER, &read_buffer);
+    glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING, &pack_buffer);
+    glGetIntegerv(GL_PACK_ROW_LENGTH, &row_length);
+    glGetIntegerv(GL_PACK_SKIP_ROWS, &skip_rows);
+    glGetIntegerv(GL_PACK_SKIP_PIXELS, &skip_pixels);
+    glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, 0);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, 0);
+    glReadBuffer(GL_BACK);
+    glPixelStorei(GL_PACK_ROW_LENGTH, mw);
+    glPixelStorei(GL_PACK_SKIP_ROWS, 0);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, 0);
+    glPixelStorei(GL_PACK_ALIGNMENT, 4);
+
+    if (width > (unsigned int)mw)
+        width = mw;
+    if (height > (unsigned int)mh)
+        height = mh;
+    glReadPixels(0, 0, width, height, format, GL_UNSIGNED_BYTE, data); // GL_BGRA
+
+    glPixelStorei(GL_PACK_ROW_LENGTH, row_length);
+    glPixelStorei(GL_PACK_SKIP_ROWS, skip_rows);
+    glPixelStorei(GL_PACK_SKIP_PIXELS, skip_pixels);
+    glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER, pack_buffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, read_fbo);
+    if (read_fbo == 0)
+        glReadBuffer(read_buffer);
+
     int *pdata = data;
 
     if (vflip) {
         for (int y = 0; y < height / 2; y++) {
-            for (int x = 0; x < mw; x++) {
+            for (int x = 0; x < width; x++) {
                 int *ptop = &pdata[y * mw + x];
                 int *pbottom = &pdata[(height - y - 1) * mw + x];
 
