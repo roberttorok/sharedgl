@@ -186,8 +186,6 @@ struct gl_normal_index_pointer      glimpl_normal_ptr,
 
 struct gl_edge_flag_pointer         glimpl_edge_flag_ptr;
 
-struct gl_map_buffer                glimpl_map_buffer;
-
 float                               glimpl_global_matrix_double_to_float[GLIMPL_MAX_COUNT_FOR_MATRIX_OP];
 
 static GLuint                       glimpl_array_buffer_binding = 0;
@@ -845,7 +843,7 @@ void SGL_INTERNAL glimpl_init()
     if (GLIMPL_RUNTIME_USES_SHARED_MEMORY)
         shm_create_context();
 
-    glimpl_map_buffer.mem = scratch_buffer_get(0x1000);
+    scratch_buffer_get(0x1000);
     glimpl_initialized = true;
 }
 
@@ -1492,8 +1490,6 @@ static struct glimpl_shadow {
     bool valid, gpu_writable;
 } glimpl_shadows[GLIMPL_SHADOW_SLOTS];
 static size_t glimpl_shadow_bytes;
-static bool glimpl_shadow_deferred;
-static struct glimpl_shadow *glimpl_shadow_active;
 
 static GLuint glimpl_shadow_binding(GLenum target)
 {
@@ -1619,70 +1615,165 @@ static void glimpl_get_buffer_parameter(int cmd, GLuint buffer, GLenum pname, GL
  * the application writes to local memory, and at unmap the flushed ranges go out as
  * glBufferSubData. That needs no round trip, and unlike a real unsynchronized write
  * it can't change data that an earlier draw on the GPU is still reading.
+ *
+ * Programs can keep several buffers mapped at once: Direct3D games lock a vertex and
+ * an index buffer together, and WineD3D maps both. So each mapping has its own record
+ * and its own memory, and flush and unmap find it by the buffer bound to the target.
+ * With one shared record, GTA III lost vertex data and crashed: unmapping one buffer
+ * forgot the other's state, and both were handed the same memory.
  */
 #define GLIMPL_MAX_DEFERRED_RANGES 64
-static bool glimpl_map_deferred = false;
-static int glimpl_deferred_count = 0;
-static struct { size_t start, end; } glimpl_deferred_ranges[GLIMPL_MAX_DEFERRED_RANGES];
+#define GLIMPL_MAX_MAPS 16
 
-static void glimpl_note_deferred_flush(size_t start, size_t length)
+struct glimpl_mapping {
+    GLenum target;              /* 0 for glMapNamedBuffer* */
+    GLuint name;                /* 0 when the client doesn't track the target's binding */
+    void *mem;
+    size_t offset, length;
+    int access;
+    bool in_use;
+    bool shadow_deferred;       /* the program writes shadow->data; nothing is mapped on the host */
+    struct glimpl_shadow *shadow;
+    bool deferred;              /* SGL_DEFER_MAPS */
+    int deferred_count;
+    struct { size_t start, end; } deferred_ranges[GLIMPL_MAX_DEFERRED_RANGES];
+    void *allocation;           /* this record's own memory, kept for the next mapping */
+    size_t capacity;
+    unsigned long stamp;
+};
+
+static struct glimpl_mapping glimpl_maps[GLIMPL_MAX_MAPS];
+static unsigned long glimpl_map_stamp;
+
+static struct glimpl_mapping *glimpl_mapping_find(GLenum target, GLuint name)
+{
+    struct glimpl_mapping *newest = NULL;
+
+    for (int i = 0; i < GLIMPL_MAX_MAPS; i++) {
+        struct glimpl_mapping *m = &glimpl_maps[i];
+        if (!m->in_use || m->target != target)
+            continue;
+        if (m->name == name)
+            return m;
+        if (newest == NULL || m->stamp > newest->stamp)
+            newest = m;
+    }
+    /* a binding the client doesn't track: the newest mapping on that target */
+    return newest;
+}
+
+static struct glimpl_mapping *glimpl_mapping_begin(GLenum target, GLuint name, size_t offset, size_t length, int access)
+{
+    struct glimpl_mapping *m = NULL;
+
+    /* mapping an already mapped buffer is an error in GL; reuse its record */
+    for (int i = 0; i < GLIMPL_MAX_MAPS && m == NULL; i++)
+        if (glimpl_maps[i].in_use && glimpl_maps[i].target == target && glimpl_maps[i].name == name)
+            m = &glimpl_maps[i];
+    /* a free record, preferably one whose memory is already big enough */
+    for (int i = 0; i < GLIMPL_MAX_MAPS && m == NULL; i++)
+        if (!glimpl_maps[i].in_use && glimpl_maps[i].capacity >= length + 128)
+            m = &glimpl_maps[i];
+    for (int i = 0; i < GLIMPL_MAX_MAPS && m == NULL; i++)
+        if (!glimpl_maps[i].in_use)
+            m = &glimpl_maps[i];
+    if (m == NULL) {
+        /* more mappings at once than any program should need: drop the oldest */
+        m = &glimpl_maps[0];
+        for (int i = 1; i < GLIMPL_MAX_MAPS; i++)
+            if (glimpl_maps[i].stamp < m->stamp)
+                m = &glimpl_maps[i];
+        fprintf(stderr, "glimpl_mapping_begin: more than %d buffers mapped, dropping one\n", GLIMPL_MAX_MAPS);
+    }
+
+    if (m->capacity < length + 128) {
+        void *allocation = malloc(length + 128);
+        if (allocation == NULL)
+            return NULL;
+        free(m->allocation);
+        m->allocation = allocation;
+        m->capacity = length + 128;
+    }
+
+    m->target = target;
+    m->name = name;
+    /* as GL_MIN_MAP_BUFFER_ALIGNMENT: WineD3D can use aligned SIMD stores */
+    m->mem = (char*)(((uintptr_t)m->allocation + 63) & ~(uintptr_t)63) + (offset & 63);
+    m->offset = offset;
+    m->length = length;
+    m->access = access;
+    m->in_use = true;
+    m->shadow_deferred = false;
+    m->shadow = NULL;
+    m->deferred = false;
+    m->deferred_count = 0;
+    m->stamp = ++glimpl_map_stamp;
+    return m;
+}
+
+static void glimpl_note_deferred_flush(struct glimpl_mapping *m, size_t start, size_t length)
 {
     size_t end = start + length;
 
-    if (glimpl_deferred_count > 0) {
-        int last = glimpl_deferred_count - 1;
-        if ((start <= glimpl_deferred_ranges[last].end && end >= glimpl_deferred_ranges[last].start) ||
-            glimpl_deferred_count == GLIMPL_MAX_DEFERRED_RANGES) {
-            glimpl_deferred_ranges[last].start = MIN(glimpl_deferred_ranges[last].start, start);
-            glimpl_deferred_ranges[last].end = MAX(glimpl_deferred_ranges[last].end, end);
+    if (m->deferred_count > 0) {
+        int last = m->deferred_count - 1;
+        if ((start <= m->deferred_ranges[last].end && end >= m->deferred_ranges[last].start) ||
+            m->deferred_count == GLIMPL_MAX_DEFERRED_RANGES) {
+            m->deferred_ranges[last].start = MIN(m->deferred_ranges[last].start, start);
+            m->deferred_ranges[last].end = MAX(m->deferred_ranges[last].end, end);
             return;
         }
     }
-    glimpl_deferred_ranges[glimpl_deferred_count].start = start;
-    glimpl_deferred_ranges[glimpl_deferred_count].end = end;
-    glimpl_deferred_count++;
+    m->deferred_ranges[m->deferred_count].start = start;
+    m->deferred_ranges[m->deferred_count].end = end;
+    m->deferred_count++;
+}
+
+static bool glimpl_is_named_map_cmd(int cmd)
+{
+    return cmd == SGL_CMD_MAPNAMEDBUFFER || cmd == SGL_CMD_MAPNAMEDBUFFERRANGE ||
+        cmd == SGL_CMD_UNMAPNAMEDBUFFER || cmd == SGL_CMD_FLUSHMAPPEDNAMEDBUFFERRANGE;
+}
+
+/* the record for a target, or for a named buffer */
+static struct glimpl_mapping *glimpl_mapping_for(int cmd, GLuint buffer)
+{
+    if (glimpl_is_named_map_cmd(cmd))
+        return glimpl_mapping_find(0, buffer);
+    return glimpl_mapping_find(buffer, glimpl_shadow_binding(buffer));
 }
 
 static void *glimpl_map_buffer_range(int cmd, GLenum buffer, GLintptr offset, GLsizeiptr length, GLbitfield access)
 {
     bool ranged = true;
-    glimpl_shadow_deferred = false;
-    glimpl_shadow_active = NULL;
-    // if (glimpl_map_buffer.in_use) {
-    //     fprintf(stderr, "glimpl_map_buffer_range: map buffer already in use, returning NULL\n");
-    //     return glimpl_map_buffer.mem;
-    // }
+    bool named = glimpl_is_named_map_cmd(cmd);
+    struct glimpl_mapping *m;
 
     /*
      * length is 0 when this function is called by glMapBuffer, glMapNamedBuffer
      */
     if (length == 0) {
-        bool is_named = cmd == SGL_CMD_MAPNAMEDBUFFER;
-        int get_param_cmd = !is_named ? SGL_CMD_GETBUFFERPARAMETERIV : SGL_CMD_GETNAMEDBUFFERPARAMETERIV;
+        int get_param_cmd = !named ? SGL_CMD_GETBUFFERPARAMETERIV : SGL_CMD_GETNAMEDBUFFERPARAMETERIV;
         glimpl_get_buffer_parameter(get_param_cmd, buffer, GL_BUFFER_SIZE, (GLint*)&length);
         ranged = false;
     }
 
-    glimpl_map_buffer = (struct gl_map_buffer){
-        /* target = */  buffer,
-        /* mem = */     scratch_buffer_get(length), // calloc(length, 1), // glimpl_map_buffer.mem,
-        /* offset = */  offset,
-        /* length = */  length,
-        /* access = */  ranged ? access : 0, // glMapBuffer's GL_WRITE_ONLY etc. are enums, not these bits
-        /* in_use = */  true
-    };
+    m = glimpl_mapping_begin(named ? 0 : buffer, named ? buffer : glimpl_shadow_binding(buffer), offset, length,
+        ranged ? access : 0); // glMapBuffer's GL_WRITE_ONLY etc. are enums, not these bits
+    if (m == NULL)
+        return NULL;
 
     if (cmd == SGL_CMD_MAPBUFFERRANGE && ranged && length > 0 && offset >= 0 && glimpl_shadow_enabled()) {
-        glimpl_shadow_active = glimpl_shadow_find(glimpl_shadow_binding(buffer), true);
-        struct glimpl_shadow *shadow = glimpl_shadow_active;
+        m->shadow = glimpl_shadow_find(glimpl_shadow_binding(buffer), true);
+        struct glimpl_shadow *shadow = m->shadow;
         if (shadow && !shadow->gpu_writable && shadow->valid && shadow->offset == (size_t)offset && shadow->length == (size_t)length &&
             (access & GL_MAP_WRITE_BIT) && (access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
             !(access & (GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT))) {
-            glimpl_shadow_deferred = true;
+            m->shadow_deferred = true;
 #ifdef SGL_XP
             glimpl_profile_record(5, 1);
 #endif
-            glimpl_map_buffer.mem = shadow->data;
+            m->mem = shadow->data;
             /* No host mapping at all: the program works on the CPU copy, and
              * glUnmapBuffer sends what changed as ordinary ordered buffer updates. */
             return shadow->data;
@@ -1690,14 +1781,13 @@ static void *glimpl_map_buffer_range(int cmd, GLenum buffer, GLintptr offset, GL
         if (shadow) shadow->valid = false;
     }
     else
-        glimpl_shadow_invalidate(cmd == SGL_CMD_MAPNAMEDBUFFER || cmd == SGL_CMD_MAPNAMEDBUFFERRANGE ?
-            buffer : glimpl_shadow_binding(buffer));
+        glimpl_shadow_invalidate(named ? buffer : glimpl_shadow_binding(buffer));
 
     if (cmd == SGL_CMD_MAPBUFFERRANGE && ranged && (access & GL_MAP_FLUSH_EXPLICIT_BIT) && !(access & GL_MAP_READ_BIT) &&
         getenv("SGL_DEFER_MAPS") != NULL) { /* off by default: FIFA 2004 players scramble with it */
-        glimpl_map_deferred = true;
-        glimpl_deferred_count = 0;
-        return glimpl_map_buffer.mem;
+        m->deferred = true;
+        m->deferred_count = 0;
+        return m->mem;
     }
 
     /*
@@ -1723,27 +1813,28 @@ static void *glimpl_map_buffer_range(int cmd, GLenum buffer, GLintptr offset, GL
      * trip to the host for each one is what limits the frame rate.
      */
     if (!(ranged && (access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)) && !(access & GL_MAP_READ_BIT))) {
-        glimpl_download_buffer(glimpl_map_buffer.mem, length);
+        glimpl_download_buffer(m->mem, length);
     }
 
-    return glimpl_map_buffer.mem;
+    return m->mem;
 }
 
 static inline bool glimpl_unmap_buffer(int cmd, int buffer)
 {
-    if (glimpl_map_buffer.target != buffer) {
-        fprintf(stderr, "glimpl_unmap_buffer: target mismatch\n");
+    struct glimpl_mapping *m = glimpl_mapping_for(cmd, buffer);
+
+    if (m == NULL) {
+        fprintf(stderr, "glimpl_unmap_buffer: %x is not mapped\n", buffer);
         return GL_FALSE;
     }
 
-    if (glimpl_shadow_deferred) {
-        glimpl_shadow_deferred = false;
-        struct glimpl_shadow *shadow = glimpl_shadow_active;
+    if (m->shadow_deferred) {
+        struct glimpl_shadow *shadow = m->shadow;
         /* Upload all modified bytes, including changes outside explicit flush
          * ranges (the legacy client uploaded the whole mapping at unmap).
          * Sending unchanged VBO contents hundreds of times per frame both
          * wastes bandwidth and touches ranges earlier draws may still read. */
-        size_t size = glimpl_map_buffer.length;
+        size_t size = m->length;
         for (size_t at = 0; at < size;) {
             size_t block = MIN((size_t)256, size - at);
             if (!memcmp(shadow->data + at, shadow->committed + at, block)) {
@@ -1766,45 +1857,44 @@ static inline bool glimpl_unmap_buffer(int cmd, int buffer)
                 size_t chunk = MIN(at - done, chunk_limit);
                 if (pb_size() + chunk + 64 > pb_capacity() / 2)
                     glimpl_submit();
-                glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATA, buffer, glimpl_map_buffer.offset + done,
+                glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATA, buffer, m->offset + done,
                     chunk, shadow->data + done);
                 done += chunk;
             }
         }
-        glimpl_map_buffer.in_use = false;
+        m->in_use = false;
         if (pb_size() > pb_capacity() / 2) glimpl_submit();
         return GL_TRUE;
     }
-    if (glimpl_shadow_active && glimpl_shadow_enabled())
-        glimpl_shadow_store(glimpl_shadow_active, glimpl_map_buffer.offset,
-            glimpl_map_buffer.length, glimpl_map_buffer.mem);
+    if (m->shadow && glimpl_shadow_enabled())
+        glimpl_shadow_store(m->shadow, m->offset, m->length, m->mem);
 
-    if (glimpl_map_deferred) {
-        glimpl_map_deferred = false;
+    if (m->deferred) {
 #ifdef SGL_XP
         {
             static long maps, partial, none;
             static char line[96];
             size_t flushed_total = 0;
-            for (int i = 0; i < glimpl_deferred_count; i++)
-                flushed_total += glimpl_deferred_ranges[i].end - glimpl_deferred_ranges[i].start;
+            for (int i = 0; i < m->deferred_count; i++)
+                flushed_total += m->deferred_ranges[i].end - m->deferred_ranges[i].start;
             maps++;
             if (flushed_total == 0)
                 none++;
-            else if (flushed_total < (size_t)glimpl_map_buffer.length)
+            else if (flushed_total < (size_t)m->length)
                 partial++;
             if (maps == 2000) {
                 sprintf(line, "deferred maps %ld: partial flush %ld, no flush %ld, sample %u/%u", maps, partial, none,
-                    (unsigned)flushed_total, (unsigned)glimpl_map_buffer.length);
+                    (unsigned)flushed_total, (unsigned)m->length);
                 glimpl_note_stub(line);
             }
         }
 #endif
-        for (int i = 0; i < glimpl_deferred_count; i++) {
-            size_t start = glimpl_deferred_ranges[i].start;
-            glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATA, buffer, glimpl_map_buffer.offset + start,
-                glimpl_deferred_ranges[i].end - start, (char*)glimpl_map_buffer.mem + start);
+        for (int i = 0; i < m->deferred_count; i++) {
+            size_t start = m->deferred_ranges[i].start;
+            glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATA, buffer, m->offset + start,
+                m->deferred_ranges[i].end - start, (char*)m->mem + start);
         }
+        m->in_use = false;
         if (pb_size() > pb_capacity() / 2)
             glimpl_submit();
         return GL_TRUE;
@@ -1815,11 +1905,12 @@ static inline bool glimpl_unmap_buffer(int cmd, int buffer)
      * than it flushes when it maps for reading and writing. Real drivers tend to
      * show those writes anyway, and players' vertices depend on them.
      */
-    glimpl_upload_buffer(glimpl_map_buffer.mem, glimpl_map_buffer.length);
+    glimpl_upload_buffer(m->mem, m->length);
 
     pb_push(cmd);
     pb_push(buffer);
-    pb_push(glimpl_map_buffer.length); // internal
+    pb_push(m->length); // internal
+    m->in_use = false;
 
 #ifdef SGL_XP
     /*
@@ -1839,13 +1930,17 @@ static inline bool glimpl_unmap_buffer(int cmd, int buffer)
 
 static inline void glimpl_flush_mapped_buffer_range(int cmd, int buffer, int offset, int length)
 {
-    if (glimpl_shadow_deferred) return;
-    if (glimpl_map_deferred) {
-        glimpl_note_deferred_flush(offset, length);
+    struct glimpl_mapping *m = glimpl_mapping_for(cmd, buffer);
+
+    /* nothing mapped: GL would only raise an error, so don't send it */
+    if (m == NULL || m->shadow_deferred)
+        return;
+    if (m->deferred) {
+        glimpl_note_deferred_flush(m, offset, length);
         return;
     }
 
-    glimpl_upload_buffer((char*)glimpl_map_buffer.mem + offset, length);
+    glimpl_upload_buffer((char*)m->mem + offset, length);
     
     pb_push(cmd);
     pb_push(buffer);
@@ -8190,7 +8285,8 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params)
 void glGetBufferPointerv(GLenum target, GLenum pname, void* *params)
 {
     (void)pname;
-    *params = (glimpl_map_buffer.in_use && glimpl_map_buffer.target == target) ? glimpl_map_buffer.mem : NULL;
+    struct glimpl_mapping *m = glimpl_mapping_find(target, glimpl_shadow_binding(target));
+    *params = m != NULL ? m->mem : NULL;
 }
 
 void glDrawBuffers(GLsizei n, const GLenum* bufs)

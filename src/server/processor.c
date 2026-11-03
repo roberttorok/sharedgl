@@ -541,6 +541,40 @@ static void sgl_trace_command(int cmd, int *pb)
     }
 }
 
+/*
+ * The host mapping of the buffer bound to a target, or of a named buffer. OpenGL keeps
+ * one per buffer object, and programs can have several mapped at once: Direct3D games
+ * lock a vertex and an index buffer together. One saved pointer for all of them sent
+ * one buffer's data into another's mapping, or nowhere.
+ */
+static void *sgl_bound_mapping(GLenum target, size_t *length)
+{
+    GLint mapped = 0;
+    GLint64 size = 0;
+    void *pointer = NULL;
+    glGetBufferParameteriv(target, GL_BUFFER_MAPPED, &mapped);
+    if (mapped) {
+        glGetBufferPointerv(target, GL_BUFFER_MAP_POINTER, &pointer);
+        glGetBufferParameteri64v(target, GL_BUFFER_MAP_LENGTH, &size);
+    }
+    *length = pointer != NULL && size > 0 ? (size_t)size : 0;
+    return *length ? pointer : NULL;
+}
+
+static void *sgl_named_mapping(GLuint buffer, size_t *length)
+{
+    GLint mapped = 0;
+    GLint64 size = 0;
+    void *pointer = NULL;
+    glGetNamedBufferParameteriv(buffer, GL_BUFFER_MAPPED, &mapped);
+    if (mapped) {
+        glGetNamedBufferPointerv(buffer, GL_BUFFER_MAP_POINTER, &pointer);
+        glGetNamedBufferParameteri64v(buffer, GL_BUFFER_MAP_LENGTH, &size);
+    }
+    *length = pointer != NULL && size > 0 ? (size_t)size : 0;
+    return *length ? pointer : NULL;
+}
+
 void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
 {
     const bool profile = getenv("SGL_PROFILE") != NULL;
@@ -2816,10 +2850,12 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int target = *pb++;
                 int length = *pb++;
                 if (length > 0) {
-                    if (map_buffer != NULL && (size_t)length <= map_length)
-                        memcpy(map_buffer, uploaded, length);
+                    size_t mapped_length;
+                    void *mapping = sgl_bound_mapping(target, &mapped_length);
+                    if (mapping != NULL && (size_t)length <= mapped_length)
+                        memcpy(mapping, uploaded, length);
                     else
-                        PRINT_LOG("unmap with %d bytes rejected: mapping %p of %zu bytes, target %x\n", length, map_buffer, map_length, target);
+                        PRINT_LOG("unmap with %d bytes rejected: mapping %p of %zu bytes, target %x\n", length, mapping, mapped_length, target);
                 }
                 *(int*)(p + SGL_OFFSET_REGISTER_RETVAL) = glUnmapBuffer(target);
                 map_buffer = NULL;
@@ -3306,15 +3342,17 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int target = *pb++;
                 int offset = *pb++;
                 int length = *pb++;
-                GLint mapped = 0, access = 0;
-                glGetBufferParameteriv(target, GL_BUFFER_MAPPED, &mapped);
+                GLint access = 0;
+                size_t mapped_length;
+                void *mapping = sgl_bound_mapping(target, &mapped_length);
+                GLint mapped = mapping != NULL;
                 glGetBufferParameteriv(target, GL_BUFFER_ACCESS_FLAGS, &access);
                 /* the data has to be in the mapping before it is declared flushed */
-                if (mapped && map_buffer != NULL && offset >= 0 && length >= 0 && (size_t)offset + (size_t)length <= map_length)
-                    memcpy((char*)map_buffer + offset, uploaded, length);
+                if (mapping != NULL && offset >= 0 && length >= 0 && (size_t)offset + (size_t)length <= mapped_length)
+                    memcpy((char*)mapping + offset, uploaded, length);
                 else
                     PRINT_LOG("flush rejected: target %x offset %d length %d, mapped %d access %x, mapping %p of %zu bytes\n",
-                        target, offset, length, mapped, access, map_buffer, map_length);
+                        target, offset, length, mapped, access, mapping, mapped_length);
                 if (mapped && (access & GL_MAP_FLUSH_EXPLICIT_BIT))
                     glFlushMappedBufferRange(target, offset, length);
                 else
@@ -4179,7 +4217,14 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             case SGL_CMD_UNMAPNAMEDBUFFER: {
                 int buffer = *pb++;
                 int length = *pb++;
-                memcpy(map_buffer, uploaded, length);
+                if (length > 0) {
+                    size_t mapped_length;
+                    void *mapping = sgl_named_mapping(buffer, &mapped_length);
+                    if (mapping != NULL && (size_t)length <= mapped_length)
+                        memcpy(mapping, uploaded, length);
+                    else
+                        PRINT_LOG("unmap with %d bytes rejected: mapping %p of %zu bytes, buffer %d\n", length, mapping, mapped_length, buffer);
+                }
                 *(int*)(p + SGL_OFFSET_REGISTER_RETVAL) = glUnmapNamedBuffer(buffer);
                 break;
             }
@@ -4187,7 +4232,12 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int buffer = *pb++;
                 int offset = *pb++;
                 int length = *pb++;
-                memcpy(map_buffer + offset, uploaded, length);
+                size_t mapped_length;
+                void *mapping = sgl_named_mapping(buffer, &mapped_length);
+                if (mapping != NULL && offset >= 0 && length >= 0 && (size_t)offset + (size_t)length <= mapped_length)
+                    memcpy((char*)mapping + offset, uploaded, length);
+                else
+                    PRINT_LOG("flush rejected: buffer %d offset %d length %d, mapping %p of %zu bytes\n", buffer, offset, length, mapping, mapped_length);
                 glFlushMappedNamedBufferRange(buffer, offset, length);
                 break;
             }
