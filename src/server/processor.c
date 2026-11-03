@@ -358,7 +358,8 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
     bool network_did_swap_buffers = false;
     bool begun = false;
     void *uploaded = NULL;
-    void *map_buffer;
+    void *map_buffer = NULL;
+    size_t map_length = 0;
     void *download_target = NULL;
     size_t download_offset = 0;
     ENetAddress address = {0};
@@ -2469,8 +2470,16 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             case SGL_CMD_UNMAPBUFFER: {
                 int target = *pb++;
                 int length = *pb++;
-                memcpy(map_buffer, uploaded, length);
+                if (length > 0) {
+                    if (map_buffer != NULL && (size_t)length <= map_length)
+                        memcpy(map_buffer, uploaded, length);
+                    else
+                        PRINT_LOG("unmap with %d bytes rejected: mapping %p of %zu bytes, target %x\n", length, map_buffer, map_length, target);
+                }
                 *(int*)(p + SGL_OFFSET_REGISTER_RETVAL) = glUnmapBuffer(target);
+                map_buffer = NULL;
+                map_length = 0;
+                download_target = NULL;
                 break;
             }
             case SGL_CMD_BLENDEQUATIONSEPARATE: {
@@ -2952,8 +2961,19 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int target = *pb++;
                 int offset = *pb++;
                 int length = *pb++;
-                // memcpy(map_buffer + offset, uploaded, length);
-                glFlushMappedBufferRange(target, offset, length);
+                GLint mapped = 0, access = 0;
+                glGetBufferParameteriv(target, GL_BUFFER_MAPPED, &mapped);
+                glGetBufferParameteriv(target, GL_BUFFER_ACCESS_FLAGS, &access);
+                /* the data has to be in the mapping before it is declared flushed */
+                if (mapped && map_buffer != NULL && offset >= 0 && length >= 0 && (size_t)offset + (size_t)length <= map_length)
+                    memcpy((char*)map_buffer + offset, uploaded, length);
+                else
+                    PRINT_LOG("flush rejected: target %x offset %d length %d, mapped %d access %x, mapping %p of %zu bytes\n",
+                        target, offset, length, mapped, access, map_buffer, map_length);
+                if (mapped && (access & GL_MAP_FLUSH_EXPLICIT_BIT))
+                    glFlushMappedBufferRange(target, offset, length);
+                else
+                    PRINT_LOG("flush skipped: target %x offset %d length %d, mapped %d access %x\n", target, offset, length, mapped, access);
                 break;
             }
             case SGL_CMD_ISVERTEXARRAY: {
@@ -4949,6 +4969,11 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int target = *pb++,
                     access = *pb++;
                 map_buffer = glMapBuffer(target, access);
+                {
+                    GLint size = 0;
+                    glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+                    map_length = map_buffer != NULL && size > 0 ? (size_t)size : 0;
+                }
                 download_offset = 0;
                 download_target = map_buffer;
                 break;
@@ -4959,6 +4984,9 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                     length = *pb++,
                     access = *pb++;
                 map_buffer = glMapBufferRange(target, offset, length, access);
+                map_length = map_buffer != NULL && length > 0 ? (size_t)length : 0;
+                if (map_buffer == NULL)
+                    PRINT_LOG("map failed: target %x offset %d length %d access %x\n", target, offset, length, access);
                 download_offset = 0;
                 download_target = map_buffer;
                 break;
@@ -6200,6 +6228,11 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int target = *pb++,
                     access = *pb++;
                 map_buffer = glMapBufferARB(target, access);
+                {
+                    GLint size = 0;
+                    glGetBufferParameteriv(target, GL_BUFFER_SIZE, &size);
+                    map_length = map_buffer != NULL && size > 0 ? (size_t)size : 0;
+                }
                 download_offset = 0;
                 download_target = map_buffer;
                 break;
