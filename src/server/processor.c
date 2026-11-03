@@ -4291,10 +4291,8 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                     level = *pb++,
                     xoffset = *pb++,
                     yoffset = *pb++,
-                    zoffset = *pb++,
                     width = *pb++,
                     height = *pb++,
-                    depth = *pb++,
                     format = *pb++,
                     imageSize = *pb++;
                 glCompressedTexSubImage2D(target, level, xoffset, yoffset, width, height, format, imageSize, uploaded);
@@ -4304,8 +4302,6 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int target = *pb++,
                     level = *pb++,
                     xoffset = *pb++,
-                    yoffset = *pb++,
-                    zoffset = *pb++,
                     width = *pb++,
                     format = *pb++,
                     imageSize = *pb++;
