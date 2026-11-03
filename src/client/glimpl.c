@@ -439,7 +439,9 @@ static inline void submit_shm()
 
     while (pb_global_read(SGL_OFFSET_REGISTER_SUBMIT) == 1) {
         spin_unlock(lockg);
-        while (pb_global_read(SGL_OFFSET_REGISTER_SUBMIT) == 1);
+        unsigned int backoff = 0;
+        while (pb_global_read(SGL_OFFSET_REGISTER_SUBMIT) == 1)
+            spin_backoff(&backoff);
         spin_lock(lockg);
     }
 
@@ -453,7 +455,20 @@ static inline void submit_shm()
     pb_global_write(SGL_OFFSET_REGISTER_SUBMIT, 1);
     spin_unlock(lockg);
 
-    while (pb_read(SGL_OFFSET_REGISTER_SUBMIT) == 1);
+#ifdef _WIN32
+    /* never hang process exit on a server that has already gone away */
+    if (glimpl_shutdown) {
+        unsigned int start = spin_ticks();
+        while (pb_read(SGL_OFFSET_REGISTER_SUBMIT) == 1 && spin_ticks() - start < 2000)
+            spin_pause();
+    }
+    else
+#endif
+    {
+        unsigned int backoff = 0;
+        while (pb_read(SGL_OFFSET_REGISTER_SUBMIT) == 1)
+            spin_backoff(&backoff);
+    }
     pb_reset();
 }
 
@@ -774,6 +789,7 @@ void SGL_INTERNAL glimpl_init()
 
     glimpl_shutdown = false;
     expecting_retval = true;
+    spin_init();
 
     if (network == NULL)
         init_shm(false);
