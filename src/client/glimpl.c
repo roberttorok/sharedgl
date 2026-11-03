@@ -1,5 +1,9 @@
+#ifdef SGL_NO_NETWORK
+#include <network/enet_stub.h>
+#else
 #define ENET_IMPLEMENTATION
 #include <network/enet.h>
+#endif
 #include <network/packet.h>
 
 #include <client/glimpl.h>
@@ -12,7 +16,9 @@
 
 #include <sharedgl.h>
 #include <commongl.h>
+#ifndef SGL_NO_NETWORK
 #include <lzav.h>
+#endif
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -475,7 +481,7 @@ static inline void submit_net()
     pb_reset();
 }
 
-void glimpl_submit()
+void SGL_INTERNAL glimpl_submit()
 {
     /*
      * processor stops at 0
@@ -498,7 +504,7 @@ void glimpl_submit()
         submit_net();
 }
 
-void glimpl_goodbye()
+void SGL_INTERNAL glimpl_goodbye()
 {
     if (!glimpl_initialized || glimpl_shutdown)
         return;
@@ -580,7 +586,7 @@ static inline void swap_buffers_net(int width, int height, int vflip, int format
     }
 }
 
-void glimpl_swap_buffers(int width, int height, int vflip, int format)
+void SGL_INTERNAL glimpl_swap_buffers(int width, int height, int vflip, int format)
 {
     if (GLIMPL_RUNTIME_USES_SHARED_MEMORY)
         swap_buffers_shm(width, height, vflip, format);
@@ -588,7 +594,12 @@ void glimpl_swap_buffers(int width, int height, int vflip, int format)
         swap_buffers_net(width, height, vflip, format);
 }
 
-void *glimpl_fb_address()
+bool SGL_INTERNAL glimpl_is_ready()
+{
+    return glimpl_initialized;
+}
+
+void * SGL_INTERNAL glimpl_fb_address()
 {
     /* fake framebuffer used with network feature only */
     if (!GLIMPL_RUNTIME_USES_SHARED_MEMORY)
@@ -753,7 +764,7 @@ static inline void init_net(char *network)
     icd_set_max_dimensions(packet->max_width, packet->max_height);
 }
 
-void glimpl_init()
+void SGL_INTERNAL glimpl_init()
 {
     char *network = getenv("SGL_NETWORK_ENDPOINT");
     char *gl_version_override = getenv("GL_VERSION_OVERRIDE");

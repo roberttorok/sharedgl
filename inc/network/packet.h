@@ -12,7 +12,7 @@
 #endif
 
 #ifdef _WIN32
-__pragma( pack(push, 1) )
+#pragma pack(push, 1)
 #endif
 struct PACKED sgl_packet_connect {
     uint32_t client_id;
@@ -32,7 +32,7 @@ struct PACKED sgl_packet_retval {
     uint32_t retval_v[256 / sizeof(uint32_t)];
 };
 #ifdef _WIN32
-__pragma( pack(pop))
+#pragma pack(pop)
 #endif
 
 #endif

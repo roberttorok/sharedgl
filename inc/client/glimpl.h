@@ -1,14 +1,27 @@
 #ifndef _SGL_GLIMPL_H_
 #define _SGL_GLIMPL_H_
 
+#ifndef SGL_INTERNAL
+#ifdef _WIN32
+#define SGL_INTERNAL __cdecl /* glimpl.c is built with -mrtd so that GL entry points are stdcall */
+#else
+#define SGL_INTERNAL
+#endif
+#endif
+
+
 #include <commongl.h>
 
-void glimpl_init();
-void glimpl_submit();
-void glimpl_goodbye();
-void glimpl_report(int width, int height);
-void glimpl_swap_buffers(int width, int height, int vflip, int format);
-void *glimpl_fb_address();
+#include <stdbool.h>
+
+void SGL_INTERNAL glimpl_init();
+bool SGL_INTERNAL glimpl_is_ready();
+void SGL_INTERNAL glimpl_note_stub(const char *name);
+void SGL_INTERNAL glimpl_submit();
+void SGL_INTERNAL glimpl_goodbye();
+void SGL_INTERNAL glimpl_report(int width, int height);
+void SGL_INTERNAL glimpl_swap_buffers(int width, int height, int vflip, int format);
+void *SGL_INTERNAL glimpl_fb_address();
 
 /*
  * gl... functions don't need to be public, however
@@ -17,7 +30,7 @@ void *glimpl_fb_address();
  */
 #ifdef _WIN32
 #include <client/platform/gldrv.h>
-PGLCLTPROCTABLE glimpl_GetProcTable();
+PGLCLTPROCTABLE SGL_INTERNAL glimpl_GetProcTable();
 #endif
 
 #endif

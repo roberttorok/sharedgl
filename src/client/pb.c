@@ -10,7 +10,7 @@
 #include <sys/mman.h>
 #else
 #include <windows.h>
-#include <SetupAPI.h>
+#include <setupapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>

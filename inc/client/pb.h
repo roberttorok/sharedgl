@@ -1,6 +1,15 @@
 #ifndef _SGL_PB_H_
 #define _SGL_PB_H_
 
+#ifndef SGL_INTERNAL
+#ifdef _WIN32
+#define SGL_INTERNAL __cdecl /* glimpl.c is built with -mrtd so that GL entry points are stdcall */
+#else
+#define SGL_INTERNAL
+#endif
+#endif
+
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <stddef.h>
@@ -20,49 +29,49 @@ struct pb_net_hooks {
     void(*_pb_copy_to_shared)();
 };
 
-void pb_set_net(struct pb_net_hooks hooks, size_t internal_alloc_size);
+void SGL_INTERNAL pb_set_net(struct pb_net_hooks hooks, size_t internal_alloc_size);
 
 #ifndef _WIN32
 /*
  * to-do: determine if direct_access is really unneeded
  */
-void pb_set(int pb, bool direct_access);
+void SGL_INTERNAL pb_set(int pb, bool direct_access);
 #else
 void pb_set(bool direct_access);
 void pb_unset(void);
 #endif
 
-void pb_reset();
-void pb_push(int c);
-void pb_push64(int64_t c);
-void pb_pushf(float c);
+void SGL_INTERNAL pb_reset();
+void SGL_INTERNAL pb_push(int c);
+void SGL_INTERNAL pb_push64(int64_t c);
+void SGL_INTERNAL pb_pushf(float c);
 
-int pb_read(int s);
-int64_t pb_read64(int s);
-void pb_write(int s, int c);
-int pb_global_read(int s);
-int64_t pb_global_read64(int s);
-void pb_global_write(int s, int c);
+int SGL_INTERNAL pb_read(int s);
+int64_t SGL_INTERNAL pb_read64(int s);
+void SGL_INTERNAL pb_write(int s, int c);
+int SGL_INTERNAL pb_global_read(int s);
+int64_t SGL_INTERNAL pb_global_read64(int s);
+void SGL_INTERNAL pb_global_write(int s, int c);
 
-void pb_memcpy(const void *src, size_t length);
-void pb_memcpy_unaligned(const void *src, size_t length);
-void pb_realign();
+void SGL_INTERNAL pb_memcpy(const void *src, size_t length);
+void SGL_INTERNAL pb_memcpy_unaligned(const void *src, size_t length);
+void SGL_INTERNAL pb_realign();
 
-void *pb_ptr(size_t offs);
-void *pb_global_ptr(size_t offs);
-void pb_set_client(int client_id);
+void *SGL_INTERNAL pb_ptr(size_t offs);
+void *SGL_INTERNAL pb_global_ptr(size_t offs);
+void SGL_INTERNAL pb_set_client(int client_id);
 
 /*
  * special case: return pointer within internal space
  * only used for networking junk
  * basically, todo: organize everything !!
  */
-void *pb_iptr(size_t offs);
+void *SGL_INTERNAL pb_iptr(size_t offs);
 
-size_t pb_size();
-size_t pb_capacity();
-bool pb_overflowed();
+size_t SGL_INTERNAL pb_size();
+size_t SGL_INTERNAL pb_capacity();
+bool SGL_INTERNAL pb_overflowed();
 
-void pb_copy_to_shared();
+void SGL_INTERNAL pb_copy_to_shared();
 
 #endif
