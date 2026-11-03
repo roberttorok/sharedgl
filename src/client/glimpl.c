@@ -192,6 +192,9 @@ float                               glimpl_global_matrix_double_to_float[GLIMPL_
 
 static GLuint                       glimpl_array_buffer_binding = 0;
 static GLuint                       glimpl_draw_indirect_buffer_binding = 0;
+/* while these are bound, pixel "pointers" are offsets into the buffer on the server */
+static GLuint                       glimpl_pixel_pack_buffer_binding = 0;
+static GLuint                       glimpl_pixel_unpack_buffer_binding = 0;
 static GLuint                       glimpl_current_vertex_array = 0;
 static struct gl_vertex_array_binding_state glimpl_vertex_array_bindings[GLIMPL_MAX_OBJECTS] = {
     { .name = 0, .element_array_buffer = 0, .in_use = true }
@@ -1095,6 +1098,26 @@ static inline void glimpl_upload_buffer(const void *data, size_t size)
 
 static inline void glimpl_download_buffer(void *dst, size_t size)
 {
+    if (size > SGL_VP_DOWNLOAD_BLOCK_SIZE_IN_BYTES && GLIMPL_RUNTIME_USES_SHARED_MEMORY &&
+        (pb_global_read(SGL_OFFSET_REGISTER_CAPABILITIES) & SGL_CAP_BULK_DOWNLOAD) &&
+        getenv("SGL_SMALL_DOWNLOADS") == NULL) {
+        size_t offset = (size_t)pb_global_read64(SGL_OFFSET_REGISTER_FBSTART);
+        size_t capacity = (size_t)pb_global_read64(SGL_OFFSET_REGISTER_MEMSIZE) - offset;
+        if (capacity > 0) {
+            int *reply_lock = pb_global_ptr(SGL_OFFSET_REGISTER_SWAP_BUFFERS_SYNC);
+            spin_lock(reply_lock);
+            for (size_t done = 0; done < size;) {
+                size_t length = MIN(size - done, capacity);
+                pb_push(SGL_CMD_VP_DOWNLOAD_BULK);
+                pb_push((int)length);
+                glimpl_submit();
+                memcpy((char*)dst + done, pb_global_ptr(offset), length);
+                done += length;
+            }
+            spin_unlock(reply_lock);
+            return;
+        }
+    }
     int blocks = CEIL_DIV(size, SGL_VP_DOWNLOAD_BLOCK_SIZE_IN_BYTES);
     size_t count = size;
 
@@ -1114,8 +1137,30 @@ static inline void glimpl_download_buffer(void *dst, size_t size)
     }
 }
 
+/*
+ * Points the server's next pixel command at this data: an offset when a pixel
+ * unpack buffer is bound, nothing for NULL, otherwise a copy of `size` bytes.
+ */
+static void glimpl_upload_pixels(const void *pixels, size_t size)
+{
+    if (glimpl_pixel_unpack_buffer_binding != 0) {
+        pb_push(SGL_CMD_VP_OFFSET);
+        pb_push((int)(uintptr_t)pixels);
+        return;
+    }
+    if (pixels == NULL) {
+        pb_push(SGL_CMD_VP_NULL);
+        return;
+    }
+    glimpl_upload_buffer(pixels, size);
+}
+
 static void glimpl_upload_texture(GLsizei width, GLsizei height, GLsizei depth, GLenum format, GLenum type, const void* pixels)
 {
+    if (glimpl_pixel_unpack_buffer_binding != 0) {
+        glimpl_upload_pixels(pixels, 0);
+        return;
+    }
     if (pixels == NULL) {
         pb_push(SGL_CMD_VP_NULL);
         return;
@@ -1420,7 +1465,7 @@ static void glimpl_compressed_texture_subimage(int cmd, int n_dims, GLuint textu
     const int offsets[3] = { xoffset, yoffset, zoffset };
     const int dims[3] = { width, height, depth };
 
-    glimpl_upload_buffer((void*)data, imageSize);
+    glimpl_upload_pixels(data, imageSize);
 
     pb_push(cmd);
     pb_push(texture);
@@ -1703,6 +1748,12 @@ void glBindBuffer(GLenum target, GLuint buffer)
     case GL_DRAW_INDIRECT_BUFFER:
         glimpl_draw_indirect_buffer_binding = buffer;
         break;
+    case GL_PIXEL_PACK_BUFFER:
+        glimpl_pixel_pack_buffer_binding = buffer;
+        break;
+    case GL_PIXEL_UNPACK_BUFFER:
+        glimpl_pixel_unpack_buffer_binding = buffer;
+        break;
     default:
         break;
     }
@@ -1744,18 +1795,19 @@ void glBindVertexArray(GLuint array)
 
 void glBitmap(GLsizei width, GLsizei height, GLfloat xorig, GLfloat yorig, GLfloat xmove, GLfloat ymove, const GLubyte* bitmap)
 {
-    pb_push(SGL_CMD_VP_UPLOAD);
-    pb_push(width * height / 4); /* could be very bad mistake */
-    for (int i = 0; i < (width * height / 4); i++)
-        pb_push(bitmap[i * 4] | bitmap[i * 4 + 1] << 8 | bitmap[i * 4 + 2] << 16 | bitmap[i * 4 + 3] << 24);
+    size_t row_bits = glimpl_unpack_store.row_length > 0 ? (size_t)glimpl_unpack_store.row_length : (size_t)width;
+    size_t alignment = glimpl_unpack_store.alignment > 0 ? (size_t)glimpl_unpack_store.alignment : 1;
+    size_t stride = glimpl_align_size((row_bits + 7) / 8, alignment);
+
+    glimpl_upload_pixels(bitmap, stride * (size_t)height);
 
     pb_push(SGL_CMD_BITMAP);
     pb_push(width);
     pb_push(height);
-    pb_push(xorig);
-    pb_push(yorig);
-    pb_push(xmove);
-    pb_push(ymove);
+    pb_pushf(xorig);
+    pb_pushf(yorig);
+    pb_pushf(xmove);
+    pb_pushf(ymove);
 }
 
 void glBlendFunc(GLenum sfactor, GLenum dfactor)
@@ -2289,16 +2341,19 @@ void glGetTexImage(GLenum target, GLint level, GLenum format, GLenum type, void*
     if (!width) width = 1;
 
     size_t total_size = glimpl_get_pixel_transfer_span(&glimpl_pack_store, width, height, depth, format, type);
-    
+    bool to_buffer = glimpl_pixel_pack_buffer_binding != 0;
+
     pb_push(SGL_CMD_GETTEXIMAGE);
     pb_push(target);
     pb_push(level);
     pb_push(format);
     pb_push(type);
-    pb_push(total_size);
+    pb_push(to_buffer ? -1 : (int)total_size);
+    pb_push(to_buffer ? (int)(uintptr_t)pixels : 0);
 
     glimpl_submit();
-    glimpl_download_buffer(pixels, total_size);
+    if (!to_buffer)
+        glimpl_download_buffer(pixels, total_size);
 }
 
 void glLightModelfv(GLenum pname, const GLfloat* params)
@@ -2816,7 +2871,22 @@ GLenum glGetError(void)
 
 void glReadPixels(GLint x, GLint y, GLsizei width, GLsizei height, GLenum format, GLenum type, void* pixels)
 {
-    STUB();
+    size_t total_size = glimpl_get_pixel_transfer_span(&glimpl_pack_store, width, height, 1, format, type);
+    bool to_buffer = glimpl_pixel_pack_buffer_binding != 0;
+
+    pb_push(SGL_CMD_READPIXELS);
+    pb_push(x);
+    pb_push(y);
+    pb_push(width);
+    pb_push(height);
+    pb_push(format);
+    pb_push(type);
+    pb_push(to_buffer ? -1 : (int)total_size);
+    pb_push(to_buffer ? (int)(uintptr_t)pixels : 0);
+
+    glimpl_submit();
+    if (!to_buffer)
+        glimpl_download_buffer(pixels, total_size);
 }
 
 GLboolean glIsEnabled(GLenum cap)
@@ -7322,7 +7392,13 @@ void glPixelMapusv(GLenum map, GLsizei mapsize, const GLushort* values)
 
 void glDrawPixels(GLsizei width, GLsizei height, GLenum format, GLenum type, const void* pixels)
 {
-    STUB();
+    glimpl_upload_texture(width, height, 1, format, type, pixels);
+
+    pb_push(SGL_CMD_DRAWPIXELS);
+    pb_push(width);
+    pb_push(height);
+    pb_push(format);
+    pb_push(type);
 }
 
 void glGetClipPlane(GLenum plane, GLdouble* equation)
@@ -7640,9 +7716,7 @@ void glCompressedTexImage3D(GLenum target, GLint level, GLenum internalformat, G
 {
     glimpl_submit();
 
-    pb_push(SGL_CMD_VP_UPLOAD);
-    pb_push(imageSize / 4);
-    pb_memcpy((void*)data, imageSize);
+    glimpl_upload_pixels(data, imageSize);
 
     pb_push(SGL_CMD_COMPRESSEDTEXIMAGE3D);
     pb_push(target);
@@ -7661,9 +7735,7 @@ void glCompressedTexImage2D(GLenum target, GLint level, GLenum internalformat, G
 {
     glimpl_submit();
 
-    pb_push(SGL_CMD_VP_UPLOAD);
-    pb_push(imageSize / 4);
-    pb_memcpy((void*)data, imageSize);
+    glimpl_upload_pixels(data, imageSize);
 
     pb_push(SGL_CMD_COMPRESSEDTEXIMAGE2D);
     pb_push(target);
@@ -7681,9 +7753,7 @@ void glCompressedTexImage1D(GLenum target, GLint level, GLenum internalformat, G
 {
     glimpl_submit();
 
-    pb_push(SGL_CMD_VP_UPLOAD);
-    pb_push(imageSize / 4);
-    pb_memcpy((void*)data, imageSize);
+    glimpl_upload_pixels(data, imageSize);
 
     pb_push(SGL_CMD_COMPRESSEDTEXIMAGE1D);
     pb_push(target);
@@ -7716,10 +7786,20 @@ void glCompressedTexSubImage1D(GLenum target, GLint level, GLint xoffset, GLsize
 
 void glGetCompressedTexImage(GLenum target, GLint level, void* img)
 {
-    /*
-     * to-do: do
-     */
-    STUB();
+    int size = 0;
+    bool to_buffer = glimpl_pixel_pack_buffer_binding != 0;
+
+    glimpl_get_texture_level_parameter(SGL_CMD_GETTEXLEVELPARAMETERIV, target, level, GL_TEXTURE_COMPRESSED_IMAGE_SIZE, &size);
+
+    pb_push(SGL_CMD_GETCOMPRESSEDTEXIMAGE);
+    pb_push(target);
+    pb_push(level);
+    pb_push(to_buffer ? -1 : size);
+    pb_push(to_buffer ? (int)(uintptr_t)img : 0);
+
+    glimpl_submit();
+    if (!to_buffer && size > 0)
+        glimpl_download_buffer(img, size);
 }
 
 void glLoadTransposeMatrixf(const GLfloat* m)
@@ -7827,7 +7907,13 @@ void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void
 
 void glGetBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, void* data)
 {
-    STUB();
+    pb_push(SGL_CMD_GETBUFFERSUBDATA);
+    pb_push(target);
+    pb_push((int)offset);
+    pb_push((int)size);
+
+    glimpl_submit();
+    glimpl_download_buffer(data, size);
 }
 
 void* glMapBuffer(GLenum target, GLenum access)
@@ -8718,22 +8804,50 @@ void glDeleteSamplers(GLsizei count, const GLuint* samplers)
 
 void glSamplerParameteriv(GLuint sampler, GLenum pname, const GLint* param)
 {
-    STUB();
+    int count = pname == 0x1004 /* GL_TEXTURE_BORDER_COLOR */ ? 4 : 1;
+
+    pb_push(SGL_CMD_SAMPLERPARAMETERIV);
+    pb_push(sampler);
+    pb_push(pname);
+    pb_push(count);
+    for (int i = 0; i < count; i++)
+        pb_push(param[i]);
 }
 
 void glSamplerParameterfv(GLuint sampler, GLenum pname, const GLfloat* param)
 {
-    STUB();
+    int count = pname == 0x1004 /* GL_TEXTURE_BORDER_COLOR */ ? 4 : 1;
+
+    pb_push(SGL_CMD_SAMPLERPARAMETERFV);
+    pb_push(sampler);
+    pb_push(pname);
+    pb_push(count);
+    for (int i = 0; i < count; i++)
+        pb_pushf(param[i]);
 }
 
 void glSamplerParameterIiv(GLuint sampler, GLenum pname, const GLint* param)
 {
-    STUB();
+    int count = pname == 0x1004 /* GL_TEXTURE_BORDER_COLOR */ ? 4 : 1;
+
+    pb_push(SGL_CMD_SAMPLERPARAMETERIIV);
+    pb_push(sampler);
+    pb_push(pname);
+    pb_push(count);
+    for (int i = 0; i < count; i++)
+        pb_push(param[i]);
 }
 
 void glSamplerParameterIuiv(GLuint sampler, GLenum pname, const GLuint* param)
 {
-    STUB();
+    int count = pname == 0x1004 /* GL_TEXTURE_BORDER_COLOR */ ? 4 : 1;
+
+    pb_push(SGL_CMD_SAMPLERPARAMETERIUIV);
+    pb_push(sampler);
+    pb_push(pname);
+    pb_push(count);
+    for (int i = 0; i < count; i++)
+        pb_push(param[i]);
 }
 
 void glGetSamplerParameteriv(GLuint sampler, GLenum pname, GLint* params)

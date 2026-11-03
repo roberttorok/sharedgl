@@ -441,6 +441,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
     *(int*)((char*)shared + SGL_OFFSET_REGISTER_SUBMIT) = 0;
     *(int*)((char*)shared + SGL_OFFSET_REGISTER_FIFO_SIZE) = (int)fifo_size;
     *(int*)((char*)shared + SGL_OFFSET_REGISTER_MAX_CLIENTS) = SGL_MAX_CLIENTS;
+    *(int*)((char*)shared + SGL_OFFSET_REGISTER_CAPABILITIES) = SGL_CAP_BULK_DOWNLOAD;
 
     if (args.internal_cmd_ptr)
         *args.internal_cmd_ptr = &cmd;
@@ -590,6 +591,18 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 download_offset += length;
                 break;
             }
+            case SGL_CMD_VP_DOWNLOAD_BULK: {
+                unsigned int length = (unsigned int)*pb++;
+                /* Clients hold SWAP_BUFFERS_SYNC until they have copied the
+                 * reply. Never borrow the FIFO: another client can submit
+                 * there as soon as we have copied its command buffer. */
+                if (net_ctx == NULL && length <= framebuffer_size) {
+                    size_t offset = *(uint64_t*)((char*)shared + SGL_OFFSET_REGISTER_FBSTART);
+                    memmove((char*)shared + offset, (char*)download_target + download_offset, length);
+                    download_offset += length;
+                }
+                break;
+            }
             
             /*
              * OpenGL Implementation
@@ -635,11 +648,11 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 break;
             case SGL_CMD_BITMAP: {
                 int width = *pb++,
-                    height = *pb++,
-                    xorig = *pb++,
-                    yorig = *pb++,
-                    xmove = *pb++,
-                    ymove = *pb++;
+                    height = *pb++;
+                float xorig = *((float*)pb++),
+                      yorig = *((float*)pb++),
+                      xmove = *((float*)pb++),
+                      ymove = *((float*)pb++);
                 glBitmap(width, height, xorig, yorig, xmove, ymove, uploaded);
                 break;
             }
@@ -885,10 +898,85 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                     level = *pb++,
                     format = *pb++,
                     type = *pb++,
-                    total_size = *pb++;
+                    total_size = *pb++,
+                    buffer_offset = *pb++;
+                if (total_size < 0) {
+                    glGetTexImage(target, level, format, type, (void*)(uintptr_t)buffer_offset);
+                    break;
+                }
                 glGetTexImage(target, level, format, type, scratch_buffer_get(total_size));
                 download_offset = 0;
                 download_target = scratch_buffer_get(total_size);
+                break;
+            }
+            case SGL_CMD_GETCOMPRESSEDTEXIMAGE: {
+                int target = *pb++,
+                    level = *pb++,
+                    total_size = *pb++,
+                    buffer_offset = *pb++;
+                if (total_size < 0) {
+                    glGetCompressedTexImage(target, level, (void*)(uintptr_t)buffer_offset);
+                    break;
+                }
+                glGetCompressedTexImage(target, level, scratch_buffer_get(total_size ? total_size : 1));
+                download_offset = 0;
+                download_target = scratch_buffer_get(total_size ? total_size : 1);
+                break;
+            }
+            case SGL_CMD_READPIXELS: {
+                int x = *pb++,
+                    y = *pb++,
+                    width = *pb++,
+                    height = *pb++,
+                    format = *pb++,
+                    type = *pb++,
+                    total_size = *pb++,
+                    buffer_offset = *pb++;
+                if (total_size < 0) {
+                    glReadPixels(x, y, width, height, format, type, (void*)(uintptr_t)buffer_offset);
+                    break;
+                }
+                glReadPixels(x, y, width, height, format, type, scratch_buffer_get(total_size ? total_size : 1));
+                download_offset = 0;
+                download_target = scratch_buffer_get(total_size ? total_size : 1);
+                break;
+            }
+            case SGL_CMD_DRAWPIXELS: {
+                int width = *pb++,
+                    height = *pb++,
+                    format = *pb++,
+                    type = *pb++;
+                glDrawPixels(width, height, format, type, uploaded);
+                break;
+            }
+            case SGL_CMD_GETBUFFERSUBDATA: {
+                int target = *pb++,
+                    offset = *pb++,
+                    size = *pb++;
+                glGetBufferSubData(target, offset, size, scratch_buffer_get(size ? size : 1));
+                download_offset = 0;
+                download_target = scratch_buffer_get(size ? size : 1);
+                break;
+            }
+            case SGL_CMD_VP_OFFSET:
+                uploaded = (void*)(uintptr_t)(unsigned int)*pb++;
+                break;
+            case SGL_CMD_SAMPLERPARAMETERIV:
+            case SGL_CMD_SAMPLERPARAMETERFV:
+            case SGL_CMD_SAMPLERPARAMETERIIV:
+            case SGL_CMD_SAMPLERPARAMETERIUIV: {
+                int sampler = *pb++,
+                    pname = *pb++,
+                    count = *pb++;
+                if (cmd == SGL_CMD_SAMPLERPARAMETERIV)
+                    glSamplerParameteriv(sampler, pname, pb);
+                else if (cmd == SGL_CMD_SAMPLERPARAMETERFV)
+                    glSamplerParameterfv(sampler, pname, (float*)pb);
+                else if (cmd == SGL_CMD_SAMPLERPARAMETERIIV)
+                    glSamplerParameterIiv(sampler, pname, pb);
+                else
+                    glSamplerParameterIuiv(sampler, pname, (unsigned int*)pb);
+                pb += count;
                 break;
             }
             case SGL_CMD_LIGHTMODELFV: {

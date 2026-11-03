@@ -45,6 +45,8 @@
 #define SGL_OFFSET_REGISTER_STAGE_SIZE          (sizeof(int) * 15)
 #define SGL_OFFSET_REGISTER_FIFO_SIZE           (sizeof(int) * 16)
 #define SGL_OFFSET_REGISTER_MAX_CLIENTS         (sizeof(int) * 17)
+#define SGL_OFFSET_REGISTER_CAPABILITIES        (sizeof(int) * 18)
+#define SGL_CAP_BULK_DOWNLOAD                   1
 #define SGL_OFFSET_COMMAND_START                0x1000
 
 #define SGL_CLIENT_SLOT_SIZE                    SGL_OFFSET_COMMAND_START
@@ -1199,6 +1201,9 @@ enum {
     SGL_CMD_ACTIVETEXTUREARB,
     SGL_CMD_MULTITEXCOORD2FARB,
     SGL_CMD_BUFFERSUBDATAARB,
+
+    SGL_CMD_VP_OFFSET,          // next pixel command reads from this offset in the bound unpack buffer
+    SGL_CMD_VP_DOWNLOAD_BULK,   // shared framebuffer used as a locked bulk reply buffer
 
     SGL_CMD_MAX
 };
