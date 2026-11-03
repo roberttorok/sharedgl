@@ -1478,8 +1478,93 @@ static void glimpl_compressed_texture_subimage(int cmd, int n_dims, GLuint textu
     pb_push(imageSize);
 }
 
+/* A private copy for write-only streaming maps. Unlike the old deferred path,
+ * retain the complete mapping, including bytes outside explicit flush ranges.
+ * Stop using copies if buffers can be written by the GPU. */
+#define GLIMPL_SHADOW_SLOTS 256
+#define GLIMPL_SHADOW_LIMIT (32u * 1024u * 1024u)
+static struct glimpl_shadow {
+    GLuint name;
+    size_t offset, length;
+    unsigned char *data;
+    unsigned char *committed;
+    void *allocation;
+    bool valid, gpu_writable;
+} glimpl_shadows[GLIMPL_SHADOW_SLOTS];
+static size_t glimpl_shadow_bytes;
+static bool glimpl_shadow_deferred;
+static struct glimpl_shadow *glimpl_shadow_active;
+
+static GLuint glimpl_shadow_binding(GLenum target)
+{
+    if (target == GL_ARRAY_BUFFER) return glimpl_array_buffer_binding;
+    if (target == GL_ELEMENT_ARRAY_BUFFER) return glimpl_get_element_array_buffer_binding();
+    return 0;
+}
+
+static struct glimpl_shadow *glimpl_shadow_find(GLuint name, bool create)
+{
+    struct glimpl_shadow *empty = NULL;
+    if (!name) return NULL;
+    for (int i = 0; i < GLIMPL_SHADOW_SLOTS; i++) {
+        if (glimpl_shadows[i].name == name) return &glimpl_shadows[i];
+        if (!glimpl_shadows[i].name && !empty) empty = &glimpl_shadows[i];
+    }
+    if (create && empty) empty->name = name;
+    return create ? empty : NULL;
+}
+
+static void glimpl_shadow_invalidate(GLuint name)
+{
+    for (int i = 0; i < GLIMPL_SHADOW_SLOTS; i++)
+        if (!name || glimpl_shadows[i].name == name) glimpl_shadows[i].valid = false;
+}
+
+static void glimpl_shadow_bind(GLenum target, GLuint name)
+{
+    /* Reader-only targets are harmless. Any GPU destination disables the
+     * optimization for this process, including future mappings. */
+    if (name && target != GL_ARRAY_BUFFER && target != GL_ELEMENT_ARRAY_BUFFER &&
+        target != GL_UNIFORM_BUFFER && target != GL_PIXEL_UNPACK_BUFFER &&
+        target != GL_COPY_READ_BUFFER && target != GL_DRAW_INDIRECT_BUFFER) {
+        struct glimpl_shadow *shadow = glimpl_shadow_find(name, true);
+        if (shadow) { shadow->gpu_writable = true; shadow->valid = false; }
+    }
+}
+
+static bool glimpl_shadow_enabled(void)
+{
+    /* On by default; SGL_NO_SHADOW_MAPS restores reading every map back from the host. */
+    static int enabled = -1;
+    if (enabled < 0)
+        enabled = getenv("SGL_NO_SHADOW_MAPS") == NULL;
+    return enabled != 0;
+}
+
+static void glimpl_shadow_store(struct glimpl_shadow *shadow, size_t offset, size_t length, const void *data)
+{
+    if (!shadow || shadow->gpu_writable || !length || length > GLIMPL_SHADOW_LIMIT) return;
+    if (shadow->length != length) {
+        if (glimpl_shadow_bytes - shadow->length + length > GLIMPL_SHADOW_LIMIT) return;
+        void *copy = malloc(2 * (length + 127));
+        if (!copy) return;
+        glimpl_shadow_bytes = glimpl_shadow_bytes - shadow->length + length;
+        free(shadow->allocation);
+        shadow->allocation = copy;
+        shadow->length = length;
+    }
+    /* Match GL_MIN_MAP_BUFFER_ALIGNMENT; WineD3D can use aligned SIMD stores. */
+    shadow->data = (unsigned char*)(((uintptr_t)shadow->allocation + 63) & ~(uintptr_t)63) + (offset & 63);
+    shadow->committed = (unsigned char*)(((uintptr_t)shadow->data + length + 127) & ~(uintptr_t)63);
+    if (shadow->data != data) memcpy(shadow->data, data, length);
+    memcpy(shadow->committed, data, length);
+    shadow->offset = offset;
+    shadow->valid = true;
+}
+
 static void glimpl_buffer_store_data(int cmd, GLuint buffer, GLsizeiptr size, const void *data, GLenum usage)
 {
+    glimpl_shadow_invalidate(cmd == SGL_CMD_NAMEDBUFFERDATA || cmd == SGL_CMD_NAMEDBUFFERSTORAGE ? buffer : glimpl_shadow_binding(buffer));
     if (data != NULL)
         glimpl_upload_buffer(data, size);
     
@@ -1503,6 +1588,7 @@ static void glimpl_buffer_subdata(int cmd, GLuint buffer, GLintptr offset, GLsiz
 static void glimpl_buffer_clear_data(int cmd, bool is_subdata, GLenum buffer, GLenum internalformat, GLintptr offset, 
         GLsizeiptr size, GLenum format, GLenum type, const void* data)
 {
+    glimpl_shadow_invalidate(0);
     pb_push(cmd);
     pb_push(buffer);
     pb_push(internalformat);
@@ -1527,9 +1613,41 @@ static void glimpl_get_buffer_parameter(int cmd, GLuint buffer, GLenum pname, GL
     *params = pb_read(SGL_OFFSET_REGISTER_RETVAL);
 }
 
+/*
+ * WineD3D streams vertices through write-only, unsynchronized, explicitly flushed
+ * mappings, hundreds of times per frame. Those never touch the host's buffer here:
+ * the application writes to local memory, and at unmap the flushed ranges go out as
+ * glBufferSubData. That needs no round trip, and unlike a real unsynchronized write
+ * it can't change data that an earlier draw on the GPU is still reading.
+ */
+#define GLIMPL_MAX_DEFERRED_RANGES 64
+static bool glimpl_map_deferred = false;
+static int glimpl_deferred_count = 0;
+static struct { size_t start, end; } glimpl_deferred_ranges[GLIMPL_MAX_DEFERRED_RANGES];
+
+static void glimpl_note_deferred_flush(size_t start, size_t length)
+{
+    size_t end = start + length;
+
+    if (glimpl_deferred_count > 0) {
+        int last = glimpl_deferred_count - 1;
+        if ((start <= glimpl_deferred_ranges[last].end && end >= glimpl_deferred_ranges[last].start) ||
+            glimpl_deferred_count == GLIMPL_MAX_DEFERRED_RANGES) {
+            glimpl_deferred_ranges[last].start = MIN(glimpl_deferred_ranges[last].start, start);
+            glimpl_deferred_ranges[last].end = MAX(glimpl_deferred_ranges[last].end, end);
+            return;
+        }
+    }
+    glimpl_deferred_ranges[glimpl_deferred_count].start = start;
+    glimpl_deferred_ranges[glimpl_deferred_count].end = end;
+    glimpl_deferred_count++;
+}
+
 static void *glimpl_map_buffer_range(int cmd, GLenum buffer, GLintptr offset, GLsizeiptr length, GLbitfield access)
 {
     bool ranged = true;
+    glimpl_shadow_deferred = false;
+    glimpl_shadow_active = NULL;
     // if (glimpl_map_buffer.in_use) {
     //     fprintf(stderr, "glimpl_map_buffer_range: map buffer already in use, returning NULL\n");
     //     return glimpl_map_buffer.mem;
@@ -1550,9 +1668,37 @@ static void *glimpl_map_buffer_range(int cmd, GLenum buffer, GLintptr offset, GL
         /* mem = */     scratch_buffer_get(length), // calloc(length, 1), // glimpl_map_buffer.mem,
         /* offset = */  offset,
         /* length = */  length,
-        /* access = */  access,
+        /* access = */  ranged ? access : 0, // glMapBuffer's GL_WRITE_ONLY etc. are enums, not these bits
         /* in_use = */  true
     };
+
+    if (cmd == SGL_CMD_MAPBUFFERRANGE && ranged && length > 0 && offset >= 0 && glimpl_shadow_enabled()) {
+        glimpl_shadow_active = glimpl_shadow_find(glimpl_shadow_binding(buffer), true);
+        struct glimpl_shadow *shadow = glimpl_shadow_active;
+        if (shadow && !shadow->gpu_writable && shadow->valid && shadow->offset == (size_t)offset && shadow->length == (size_t)length &&
+            (access & GL_MAP_WRITE_BIT) && (access & GL_MAP_FLUSH_EXPLICIT_BIT) &&
+            !(access & (GL_MAP_PERSISTENT_BIT | GL_MAP_COHERENT_BIT))) {
+            glimpl_shadow_deferred = true;
+#ifdef SGL_XP
+            glimpl_profile_record(5, 1);
+#endif
+            glimpl_map_buffer.mem = shadow->data;
+            /* No host mapping at all: the program works on the CPU copy, and
+             * glUnmapBuffer sends what changed as ordinary ordered buffer updates. */
+            return shadow->data;
+        }
+        if (shadow) shadow->valid = false;
+    }
+    else
+        glimpl_shadow_invalidate(cmd == SGL_CMD_MAPNAMEDBUFFER || cmd == SGL_CMD_MAPNAMEDBUFFERRANGE ?
+            buffer : glimpl_shadow_binding(buffer));
+
+    if (cmd == SGL_CMD_MAPBUFFERRANGE && ranged && (access & GL_MAP_FLUSH_EXPLICIT_BIT) && !(access & GL_MAP_READ_BIT) &&
+        getenv("SGL_DEFER_MAPS") != NULL) { /* off by default: FIFA 2004 players scramble with it */
+        glimpl_map_deferred = true;
+        glimpl_deferred_count = 0;
+        return glimpl_map_buffer.mem;
+    }
 
     /*
      * this function supports both glMapBuffer and glMapBufferRange; as such, these functions have
@@ -1570,9 +1716,15 @@ static void *glimpl_map_buffer_range(int cmd, GLenum buffer, GLintptr offset, GL
         pb_push(access);
     }
 
-    glimpl_submit();
-
-    glimpl_download_buffer(glimpl_map_buffer.mem, length);
+    /*
+     * Invalidated contents are undefined, so don't read them back. That also means
+     * no reply is needed, so the map can travel with the next batch.
+     * WineD3D streams vertices this way hundreds of times per frame, and a round
+     * trip to the host for each one is what limits the frame rate.
+     */
+    if (!(ranged && (access & (GL_MAP_INVALIDATE_RANGE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT)) && !(access & GL_MAP_READ_BIT))) {
+        glimpl_download_buffer(glimpl_map_buffer.mem, length);
+    }
 
     return glimpl_map_buffer.mem;
 }
@@ -1584,19 +1736,115 @@ static inline bool glimpl_unmap_buffer(int cmd, int buffer)
         return GL_FALSE;
     }
 
+    if (glimpl_shadow_deferred) {
+        glimpl_shadow_deferred = false;
+        struct glimpl_shadow *shadow = glimpl_shadow_active;
+        /* Upload all modified bytes, including changes outside explicit flush
+         * ranges (the legacy client uploaded the whole mapping at unmap).
+         * Sending unchanged VBO contents hundreds of times per frame both
+         * wastes bandwidth and touches ranges earlier draws may still read. */
+        size_t size = glimpl_map_buffer.length;
+        for (size_t at = 0; at < size;) {
+            size_t block = MIN((size_t)256, size - at);
+            if (!memcmp(shadow->data + at, shadow->committed + at, block)) {
+                at += block;
+                continue;
+            }
+            size_t start = at;
+            at += block;
+            while (at < size) {
+                block = MIN((size_t)256, size - at);
+                if (!memcmp(shadow->data + at, shadow->committed + at, block)) break;
+                at += block;
+            }
+            memcpy(shadow->committed + start, shadow->data + start, at - start);
+            /* Unlike a write through an unsynchronized mapping, this cannot change
+             * data an earlier draw is still reading. These maps no longer force a
+             * submit, so keep a growing batch from overflowing and being dropped. */
+            size_t chunk_limit = pb_capacity() / 4;
+            for (size_t done = start; done < at;) {
+                size_t chunk = MIN(at - done, chunk_limit);
+                if (pb_size() + chunk + 64 > pb_capacity() / 2)
+                    glimpl_submit();
+                glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATA, buffer, glimpl_map_buffer.offset + done,
+                    chunk, shadow->data + done);
+                done += chunk;
+            }
+        }
+        glimpl_map_buffer.in_use = false;
+        if (pb_size() > pb_capacity() / 2) glimpl_submit();
+        return GL_TRUE;
+    }
+    if (glimpl_shadow_active && glimpl_shadow_enabled())
+        glimpl_shadow_store(glimpl_shadow_active, glimpl_map_buffer.offset,
+            glimpl_map_buffer.length, glimpl_map_buffer.mem);
+
+    if (glimpl_map_deferred) {
+        glimpl_map_deferred = false;
+#ifdef SGL_XP
+        {
+            static long maps, partial, none;
+            static char line[96];
+            size_t flushed_total = 0;
+            for (int i = 0; i < glimpl_deferred_count; i++)
+                flushed_total += glimpl_deferred_ranges[i].end - glimpl_deferred_ranges[i].start;
+            maps++;
+            if (flushed_total == 0)
+                none++;
+            else if (flushed_total < (size_t)glimpl_map_buffer.length)
+                partial++;
+            if (maps == 2000) {
+                sprintf(line, "deferred maps %ld: partial flush %ld, no flush %ld, sample %u/%u", maps, partial, none,
+                    (unsigned)flushed_total, (unsigned)glimpl_map_buffer.length);
+                glimpl_note_stub(line);
+            }
+        }
+#endif
+        for (int i = 0; i < glimpl_deferred_count; i++) {
+            size_t start = glimpl_deferred_ranges[i].start;
+            glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATA, buffer, glimpl_map_buffer.offset + start,
+                glimpl_deferred_ranges[i].end - start, (char*)glimpl_map_buffer.mem + start);
+        }
+        if (pb_size() > pb_capacity() / 2)
+            glimpl_submit();
+        return GL_TRUE;
+    }
+
+    /*
+     * The whole range, even for explicitly flushed mappings: WineD3D writes more
+     * than it flushes when it maps for reading and writing. Real drivers tend to
+     * show those writes anyway, and players' vertices depend on them.
+     */
     glimpl_upload_buffer(glimpl_map_buffer.mem, glimpl_map_buffer.length);
 
     pb_push(cmd);
     pb_push(buffer);
     pb_push(glimpl_map_buffer.length); // internal
 
+#ifdef SGL_XP
+    /*
+     * Unmap only fails if the buffer was corrupted by a display mode change, which
+     * can't happen to a buffer on the host, so don't wait for the answer. Batches
+     * do have to stay well inside the command buffer: an overflow drops them.
+     */
+    if (pb_size() > pb_capacity() / 2)
+        glimpl_submit();
+    return GL_TRUE;
+#else
     glimpl_submit();
     int res = pb_read(SGL_OFFSET_REGISTER_RETVAL);
     return *(bool*)&res;
+#endif
 }
 
 static inline void glimpl_flush_mapped_buffer_range(int cmd, int buffer, int offset, int length)
 {
+    if (glimpl_shadow_deferred) return;
+    if (glimpl_map_deferred) {
+        glimpl_note_deferred_flush(offset, length);
+        return;
+    }
+
     glimpl_upload_buffer((char*)glimpl_map_buffer.mem + offset, length);
     
     pb_push(cmd);
@@ -1738,6 +1986,7 @@ void glBeginQuery(GLenum target, GLuint id)
 
 void glBindBuffer(GLenum target, GLuint buffer)
 {
+    glimpl_shadow_bind(target, buffer);
     switch (target) {
     case GL_ARRAY_BUFFER:
         glimpl_array_buffer_binding = buffer;
@@ -1765,6 +2014,7 @@ void glBindBuffer(GLenum target, GLuint buffer)
 
 void glBindBuffersBase(GLenum target, GLuint first, GLsizei count, const GLuint *buffers)
 {
+    if (buffers) for (int i = 0; i < count; i++) glimpl_shadow_bind(target, buffers[i]);
     pb_push(SGL_CMD_VP_UPLOAD);
     pb_push(count); /* could be very bad mistake */
     for (int i = 0; i < count; i++)
@@ -1895,6 +2145,12 @@ GLuint glCreateShader(GLenum type)
 void glDeleteBuffers(GLsizei n, const GLuint* buffers)
 {
     for (int i = 0; i < n; i++) {
+        struct glimpl_shadow *shadow = glimpl_shadow_find(buffers[i], false);
+        if (shadow) {
+            glimpl_shadow_bytes -= shadow->length;
+            free(shadow->allocation);
+            memset(shadow, 0, sizeof(*shadow));
+        }
         pb_push(SGL_CMD_DELETEBUFFERS);
         pb_push(buffers[i]);
     }
@@ -4658,6 +4914,7 @@ void glEndTransformFeedback(void)
 
 void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size)
 {
+    glimpl_shadow_bind(target, buffer);
     pb_push(SGL_CMD_BINDBUFFERRANGE);
     pb_push(target);
     pb_push(index);
@@ -4668,6 +4925,7 @@ void glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offs
 
 void glBindBufferBase(GLenum target, GLuint index, GLuint buffer)
 {
+    glimpl_shadow_bind(target, buffer);
     pb_push(SGL_CMD_BINDBUFFERBASE);
     pb_push(target);
     pb_push(index);
@@ -4976,6 +5234,7 @@ void glPrimitiveRestartIndex(GLuint index)
 
 void glCopyBufferSubData(GLenum readTarget, GLenum writeTarget, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size)
 {
+    glimpl_shadow_invalidate(0);
     pb_push(SGL_CMD_COPYBUFFERSUBDATA);
     pb_push(readTarget);
     pb_push(writeTarget);
@@ -5900,6 +6159,7 @@ void glTransformFeedbackBufferRange(GLuint xfb, GLuint index, GLuint buffer, GLi
 
 void glCopyNamedBufferSubData(GLuint readBuffer, GLuint writeBuffer, GLintptr readOffset, GLintptr writeOffset, GLsizeiptr size)
 {
+    glimpl_shadow_invalidate(writeBuffer);
     pb_push(SGL_CMD_COPYNAMEDBUFFERSUBDATA);
     pb_push(readBuffer);
     pb_push(writeBuffer);
@@ -7902,6 +8162,7 @@ void glGetQueryObjectuiv(GLuint id, GLenum pname, GLuint* params)
 
 void glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void* data)
 {
+    glimpl_shadow_invalidate(glimpl_shadow_binding(target));
     glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATA, target, offset, size, data);
 }
 
@@ -7928,7 +8189,8 @@ void glGetBufferParameteriv(GLenum target, GLenum pname, GLint* params)
 
 void glGetBufferPointerv(GLenum target, GLenum pname, void* *params)
 {
-    STUB();
+    (void)pname;
+    *params = (glimpl_map_buffer.in_use && glimpl_map_buffer.target == target) ? glimpl_map_buffer.mem : NULL;
 }
 
 void glDrawBuffers(GLsizei n, const GLenum* bufs)
@@ -9951,6 +10213,7 @@ void glClearTexSubImage(GLuint texture, GLint level, GLint xoffset, GLint yoffse
 
 void glBindBuffersRange(GLenum target, GLuint first, GLsizei count, const GLuint* buffers, const GLintptr* offsets, const GLsizeiptr* sizes)
 {
+    if (buffers) for (int i = 0; i < count; i++) glimpl_shadow_bind(target, buffers[i]);
     pb_push(SGL_CMD_BINDBUFFERSRANGE);
     pb_push(target);
     pb_push(first);
@@ -10088,6 +10351,7 @@ void glNamedBufferData(GLuint buffer, GLsizeiptr size, const void* data, GLenum 
 
 void glNamedBufferSubData(GLuint buffer, GLintptr offset, GLsizeiptr size, const void* data)
 {
+    glimpl_shadow_invalidate(buffer);
     glimpl_buffer_subdata(SGL_CMD_NAMEDBUFFERSUBDATA, buffer, offset, size, data);
 }
 
@@ -11070,6 +11334,7 @@ void glBufferDataARB(GLenum target, GLsizeiptrARB size, const void* data, GLenum
 
 void glBufferSubDataARB(GLenum target, GLintptr offset, GLsizeiptr size, const void* data)
 {
+    glimpl_shadow_invalidate(glimpl_shadow_binding(target));
     glimpl_buffer_subdata(SGL_CMD_BUFFERSUBDATAARB, target, offset, size, data);
 }
 
@@ -11098,10 +11363,7 @@ GLhandleARB glCreateShaderObjectARB(GLenum shaderType)
 
 void glDeleteBuffersARB(GLsizei n, const GLuint* buffers)
 {
-    for (int i = 0; i < n; i++) {
-        pb_push(SGL_CMD_DELETEBUFFERSARB);
-        pb_push(buffers[i]);
-    }
+    glDeleteBuffers(n, buffers);
 }
 
 void glDeleteObjectARB(GLhandleARB obj)
