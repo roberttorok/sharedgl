@@ -1,0 +1,20 @@
+# Build directories: build/ (upstream's README), build-host/ and build-win/ (qemu-xp-3d's Makefile)
+/build/
+/build-*/
+
+# Compiler output
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dll
+*.exe
+*.sys
+*.pdb
+
+# Files the server writes into the folder it runs in (Windows hosts)
+sgl_fps
+sgl_frames.csv
+sgl_frames.csv.commands.csv
+sgl_profile.txt

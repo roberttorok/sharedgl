@@ -57,6 +57,8 @@ void spin_pause(void)
     _mm_pause();
 }
 
+volatile unsigned int spin_sleeps;
+
 /* For waits on the server: spin for short ones, give the CPU back for long ones. */
 void spin_backoff(unsigned int *count)
 {
@@ -71,6 +73,7 @@ void spin_backoff(unsigned int *count)
             __asm__ __volatile__("" ::: "memory");
         }
         else {
+            spin_sleeps++;
             Sleep(1);
             *count = 0;
         }
@@ -78,10 +81,14 @@ void spin_backoff(unsigned int *count)
     }
     if (++*count < 4000)
         _mm_pause();
-    else if (*count < 4100)
+    else if (*count < 4100) {
+        spin_sleeps++;
         Sleep(0);
-    else
+    }
+    else {
+        spin_sleeps++;
         Sleep(1);
+    }
 #else
     (void)count;
     _mm_pause();

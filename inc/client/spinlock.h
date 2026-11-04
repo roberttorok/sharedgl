@@ -10,6 +10,9 @@
 #endif
 
 
+/* Sleep() calls made by spin_backoff, for the frame profile (inc/sglprof.h) */
+extern volatile unsigned int spin_sleeps;
+
 void SGL_INTERNAL spin_pause(void);
 void SGL_INTERNAL spin_init(void);
 void SGL_INTERNAL spin_fini(void);

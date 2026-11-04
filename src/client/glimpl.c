@@ -34,6 +34,30 @@ void SGL_INTERNAL glimpl_profile_record(int index, unsigned long long cycles)
         stats[index] += cycles;
     }
 }
+
+#include <sglprof.h>
+#include <client/spinlock.h>
+
+/*
+ * The per-frame profile block, or NULL when the server isn't recording. Only call it
+ * once shared memory is mapped. See inc/sglprof.h.
+ */
+struct sgl_prof_shared * SGL_INTERNAL glimpl_prof(void)
+{
+    struct sgl_prof_shared *prof = pb_global_ptr(SGL_PROF_OFFSET);
+
+    if (prof->magic != SGL_PROF_MAGIC)
+        return NULL;
+    if (prof->guest_version != SGL_PROF_VERSION) {
+        /* An RDTSC that traps to the hypervisor would distort every number, so record its cost. */
+        unsigned long long begin = __rdtsc(), end = begin;
+        for (int i = 0; i < 64; i++)
+            end = __rdtsc();
+        prof->guest_rdtsc = (uint32_t)((end - begin) / 64);
+        prof->guest_version = SGL_PROF_VERSION;
+    }
+    return prof;
+}
 #endif
 
 #ifndef _WIN32
@@ -440,7 +464,9 @@ bool expecting_retval = true;
 static inline void submit_shm()
 {
 #ifdef SGL_XP
-    unsigned long long prof_begin = __rdtsc();
+    unsigned long long prof_begin = __rdtsc(), prof_locked = 0, prof_copied = 0;
+    struct sgl_prof_shared *frame_prof = glimpl_prof();
+    unsigned int prof_sleeps = spin_sleeps;
 #endif
     size_t submit_size = pb_size();
     int fifo_size = pb_global_read(SGL_OFFSET_REGISTER_FIFO_SIZE);
@@ -470,10 +496,16 @@ static inline void submit_shm()
     /*
      * copy internal buffer to shared memory and submit
      */
+#ifdef SGL_XP
+    if (frame_prof) prof_locked = __rdtsc();
+#endif
     pb_write(SGL_OFFSET_REGISTER_SUBMIT, 1);
     pb_copy_to_shared();
     pb_global_write(SGL_OFFSET_REGISTER_STAGE_CLIENT_ID, client_id);
     pb_global_write(SGL_OFFSET_REGISTER_STAGE_SIZE, (int)submit_size);
+#ifdef SGL_XP
+    if (frame_prof) prof_copied = __rdtsc();
+#endif
     pb_global_write(SGL_OFFSET_REGISTER_SUBMIT, 1);
     spin_unlock(lockg);
 
@@ -495,6 +527,15 @@ static inline void submit_shm()
 #ifdef SGL_XP
     glimpl_profile_record(0, __rdtsc() - prof_begin);
     glimpl_profile_record(1, 1);
+    if (frame_prof) {
+        unsigned long long done = __rdtsc();
+        frame_prof->counter[SGL_PROF_G_SUBMIT_LOCK] += (uint32_t)(prof_locked - prof_begin);
+        frame_prof->counter[SGL_PROF_G_SUBMIT_COPY] += (uint32_t)(prof_copied - prof_locked);
+        frame_prof->counter[SGL_PROF_G_SUBMIT_WAIT] += (uint32_t)(done - prof_copied);
+        frame_prof->counter[SGL_PROF_G_SUBMITS] += 1;
+        frame_prof->counter[SGL_PROF_G_BYTES] += (uint32_t)submit_size;
+        frame_prof->counter[SGL_PROF_G_SLEEPS] += spin_sleeps - prof_sleeps;
+    }
 #endif
 }
 

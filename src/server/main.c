@@ -32,7 +32,7 @@ static int *internal_cmd_ptr;
 extern char sgl_last_draw[];
 
 static const char *usage =
-    "usage: sglrenderer [-h] [-v] [-o] [-n] [-x] [-g MAJOR.MINOR] [-r WIDTHxHEIGHT] [-m SIZE] [-p PORT]\n"
+    "usage: sglrenderer [-h] [-v] [-o] [-n] [-x] [-q] [-g MAJOR.MINOR] [-r WIDTHxHEIGHT] [-m SIZE] [-p PORT] [-f FPS]\n"
     "\n"
     "options:\n"
     "    -h                 display help information\n"
@@ -43,7 +43,9 @@ static const char *usage =
     "    -g [MAJOR.MINOR]   report specific opengl version (default: %d.%d)\n"
     "    -r [WIDTHxHEIGHT]  set max resolution (default: 1920x1080)\n"
     "    -m [SIZE]          max amount of megabytes program may allocate (default: 32mib)\n"
-    "    -p [PORT]          if networking is enabled, specify which port to use (default: 3000)\n";
+    "    -p [PORT]          if networking is enabled, specify which port to use (default: 3000)\n"
+    "    -f [FPS]           frame rate limit for Windows XP clients, 0 = none (default: %d)\n"
+    "    -q                 Windows XP: leave the QXL display memory uncached (slower blits)\n";
 
 static void generate_virtual_machine_arguments(size_t m)
 {
@@ -121,6 +123,9 @@ int main(int argc, char **argv)
     int major = SGL_DEFAULT_MAJOR;
     int minor = SGL_DEFAULT_MINOR;
 
+    int fps_cap = SGL_FPS_CAP_DEFAULT;
+    int guest_flags = 0;
+
     shm_size = 32;
 
     signal(SIGSEGV, arg_parser_protector);
@@ -128,7 +133,7 @@ int main(int argc, char **argv)
     for (int i = 1; i < argc; i++) {
         switch (argv[i][1]) {
         case 'h':
-            fprintf(stderr, usage, SGL_DEFAULT_MAJOR, SGL_DEFAULT_MINOR);
+            fprintf(stderr, usage, SGL_DEFAULT_MAJOR, SGL_DEFAULT_MINOR, SGL_FPS_CAP_DEFAULT);
             return 0;
         case 'v':
             print_virtual_machine_arguments = true;
@@ -169,6 +174,17 @@ int main(int argc, char **argv)
         case 'p':
             port = atoi(argv[i + 1]);
             i++;
+            break;
+        case 'f':
+            fps_cap = atoi(argv[i + 1]);
+            if (fps_cap < 0 || fps_cap > 1000) {
+                PRINT_LOG("-f takes a frame rate from 0 (no limit) to 1000\n");
+                return 1;
+            }
+            i++;
+            break;
+        case 'q':
+            guest_flags |= SGL_GUEST_NO_QXL_CACHE;
             break;
         default:
             PRINT_LOG("unrecognized command-line option '%s'\n", argv[i]);
@@ -232,6 +248,16 @@ int main(int argc, char **argv)
 #endif
 
     PRINT_LOG("reserved %d MiB of memory\n", (int)(shm_size / 1024 / 1024));
+    /* PRINT_LOG is a block, so these need braces */
+    if (fps_cap > 0) {
+        PRINT_LOG("XP clients: frame rate limited to %d fps\n", fps_cap);
+    }
+    else {
+        PRINT_LOG("XP clients: frame rate not limited\n");
+    }
+    if (guest_flags & SGL_GUEST_NO_QXL_CACHE) {
+        PRINT_LOG("XP clients: QXL display memory left uncached\n");
+    }
 
     struct sgl_cmd_processor_args args = {
         .base_address = shm_ptr,
@@ -242,6 +268,9 @@ int main(int argc, char **argv)
 
         .gl_major = major,
         .gl_minor = minor,
+
+        .fps_cap = fps_cap,
+        .guest_flags = guest_flags,
 
         .internal_cmd_ptr = &internal_cmd_ptr,
     };

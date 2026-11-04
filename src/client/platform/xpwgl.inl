@@ -14,6 +14,8 @@
 #define XPWGL_MAX_WINDOWS 256
 #include <intrin.h>
 extern void SGL_INTERNAL glimpl_profile_record(int index, unsigned long long cycles);
+#include <sglprof.h>
+extern struct sgl_prof_shared * SGL_INTERNAL glimpl_prof(void);
 
 struct xpwgl_window_format {
     HWND hwnd;
@@ -24,7 +26,7 @@ static struct xpwgl_window_format xpwgl_formats[XPWGL_MAX_WINDOWS];
 static DWORD xpwgl_tls_context = TLS_OUT_OF_INDEXES;
 static DWORD xpwgl_tls_dc = TLS_OUT_OF_INDEXES;
 static LONG xpwgl_tls_once = 0;
-static int xpwgl_swap_interval = -1; /* -1: the application never asked */
+static int xpwgl_swap_interval = -1; /* -1: the application never asked; reported back only */
 
 static void xpwgl_log(const char *message)
 {
@@ -149,11 +151,20 @@ static DWORD WINAPI xpwgl_present_thread(LPVOID unused)
             LeaveCriticalSection(&xpwgl_present_lock);
 
             /* a DC of its own: GDI does not allow one DC in two threads at once */
-            hdc = GetDC(frame->window);
+            unsigned long long prof_begin = __rdtsc();
+            struct sgl_prof_shared *control = glimpl_prof();
+            hdc = control && (control->control & SGL_PROF_CTL_NO_BLIT) ? NULL : GetDC(frame->window);
             if (hdc != NULL) {
                 xpwgl_blit(hdc, frame->pixels, frame->width, frame->width, frame->height);
                 ReleaseDC(frame->window, hdc);
                 InterlockedIncrement(&xpwgl_stat_shown);
+            }
+            {
+                struct sgl_prof_shared *prof = glimpl_prof();
+                if (prof) {
+                    prof->counter[SGL_PROF_G_PRESENT_THREAD] += (uint32_t)(__rdtsc() - prof_begin);
+                    prof->counter[SGL_PROF_G_PRESENTS] += 1;
+                }
             }
         }
     }
@@ -215,39 +226,33 @@ static void xpwgl_stats(void)
 }
 
 /*
- * Rendering faster than anything can show only heats the GPU and CPU. The limit is
- * SGL_MAX_FPS if set (0 = none). Otherwise the application's swap interval sets it,
- * as vsync at 60 Hz would. Direct3D games through WineD3D that don't ask get 60;
- * plain OpenGL programs that don't ask are not limited.
+ * Rendering faster than anything can show only heats the GPU and CPU: every extra
+ * frame costs a full round trip to the host and a readback. The host alone sets the
+ * limit (sglrenderer -f, default 60, 0 = none) and publishes it in shared memory; it
+ * is read every frame. The application has no say: its swap interval is ignored, and
+ * nothing in the guest's environment is consulted. A server too old to publish a
+ * limit gets the default.
  */
 static void xpwgl_pace(void)
 {
-    static int max_fps = -1;
+    static BOOL started = FALSE;
     static LARGE_INTEGER frequency, next;
     LARGE_INTEGER now;
     LONGLONG period;
-    int fps = max_fps;
+    int cap, fps;
 
-    if (max_fps < 0) {
-        char value[16] = "";
-        if (GetEnvironmentVariableA("SGL_MAX_FPS", value, sizeof(value)) > 0)
-            max_fps = atoi(value);
-        else
-            max_fps = 1000000; /* marker: decide from the swap interval, which can change */
+    if (!started) {
         QueryPerformanceFrequency(&frequency);
         timeBeginPeriod(1); /* or XP's Sleep() only wakes every 15.6 ms */
-        fps = max_fps;
+        started = TRUE;
     }
-    if (fps == 1000000) {
-        if (xpwgl_swap_interval > 0)
-            fps = 60 / xpwgl_swap_interval;
-        else if (xpwgl_swap_interval < 0 && GetModuleHandleA("wined3d.dll") != NULL)
-            fps = 60;
-        else
-            fps = 0;
-    }
-    if (fps <= 0)
+
+    cap = *(volatile int*)pb_global_ptr(SGL_OFFSET_REGISTER_FPS_CAP);
+    fps = (cap & SGL_FPS_CAP_SET) ? (cap & SGL_FPS_CAP_MASK) : SGL_FPS_CAP_DEFAULT;
+    if (fps <= 0) {
+        next.QuadPart = 0;
         return;
+    }
 
     period = frequency.QuadPart / fps;
     QueryPerformanceCounter(&now);
@@ -302,11 +307,21 @@ static BOOL xp_present(HDC hdc)
     swap_sync_lock = pb_ptr(SGL_OFFSET_REGISTER_SWAP_BUFFERS_SYNC);
     source = glimpl_fb_address();
 
+    struct sgl_prof_shared *frame_prof = glimpl_prof();
+    unsigned long long prof_swapped = 0;
+    if (frame_prof) {
+        /* the server reads this when it handles the swap below: one guest frame per swap */
+        frame_prof->swap_tsc_lo = (uint32_t)prof_begin;
+        frame_prof->swap_tsc_hi = (uint32_t)(prof_begin >> 32);
+    }
+
     spin_lock(swap_sync_lock);
     glimpl_swap_buffers(width, height, 0, GL_BGRA);
+    if (frame_prof) prof_swapped = __rdtsc();
 
     if (xpwgl_present_mode == 0 || window == NULL) {
-        xpwgl_blit(hdc, source, max_width, width, height);
+        if (!frame_prof || !(frame_prof->control & SGL_PROF_CTL_NO_BLIT))
+            xpwgl_blit(hdc, source, max_width, width, height);
         spin_unlock(swap_sync_lock);
     }
     else {
@@ -335,6 +350,10 @@ static BOOL xp_present(HDC hdc)
     glimpl_profile_record(2, __rdtsc() - prof_begin);
     glimpl_profile_record(3, 1);
     glimpl_profile_record(4, __rdtsc() - prof_pace);
+    if (frame_prof) {
+        frame_prof->counter[SGL_PROF_G_SWAP_COPY] += (uint32_t)(prof_pace - prof_swapped);
+        frame_prof->counter[SGL_PROF_G_PACE] += (uint32_t)(__rdtsc() - prof_pace);
+    }
     return TRUE;
 }
 
@@ -703,7 +722,11 @@ static const char WINAPI *wglGetExtensionsStringARB_xp(HDC hdc)
     return wgl_extensions_ext;
 }
 
-/* presentation is a blit in the guest, so there is no real vsync: xpwgl_pace() stands in for it */
+/*
+ * Presentation is a blit in the guest, so there is no real vsync. The interval is
+ * remembered for wglGetSwapIntervalEXT only: the frame rate is the host's decision,
+ * see xpwgl_pace().
+ */
 static BOOL WINAPI wglSwapIntervalEXT(int interval)
 {
     xpwgl_swap_interval = interval;

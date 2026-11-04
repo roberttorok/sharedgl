@@ -29,6 +29,7 @@ DEFINE_GUID(GUID_DEVINTERFACE_IVSHMEM,
 #define IOCTL_IVSHMEM_REQUEST_SIZE   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_IVSHMEM_REQUEST_MMAP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_IVSHMEM_RELEASE_MMAP   CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+#define IOCTL_SGL_CACHE_QXL          CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 struct ivshmem_mmap_config {
     BYTE cache_mode;
@@ -207,6 +208,17 @@ bool pb_set(bool direct_access)
         pb_unset();
         ptr = NULL;
         return false;
+    }
+
+    /*
+     * The QXL display driver maps the card uncached, which makes every frame's blit
+     * cost ~24 ms of CPU on an AMD host. sgldrv.sys maps it write-back instead (see
+     * SglCacheQxl() there); an older sgldrv.sys rejects the request and nothing
+     * changes. The host can turn this off (sglrenderer -q).
+     */
+    if (!(*(volatile int*)((char*)ptr + SGL_OFFSET_REGISTER_GUEST_FLAGS) & SGL_GUEST_NO_QXL_CACHE)) {
+        ULONG result[4];
+        DeviceIoControl(handle, IOCTL_SGL_CACHE_QXL, NULL, 0, result, sizeof(result), &returned, NULL);
     }
 
     base = (PVOID)((uintptr_t)map.pointer + (uintptr_t)SGL_STAGE_OFFSET);

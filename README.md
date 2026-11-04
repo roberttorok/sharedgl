@@ -1,62 +1,74 @@
 # SharedGL: the `windows-support` branch
 
-This branch extends [SharedGL](https://github.com/dmaivel/sharedgl) to **Windows XP guests** and to **Windows hosts**, and makes the existing Windows client faster and more robust. Upstream supports Windows 10 and later guests, with the server on a Linux host.
+> **This branch is meant to be used with [qemu-xp-3d](https://github.com/roberttorok/qemu-xp-3d).** Windows hosts need a patched QEMU (the `ivshmem-win` device).
 
-With it, Direct3D 8 and 9 games on XP, translated to OpenGL by [WineD3D](https://github.com/JHRobotics/wine9x), run on the host's GPU. Tested with FIFA 2004, GTA III and 3DMark 2001 SE (24,586 points) in an XP SP3 guest on QEMU, with an RTX 3070 on Linux and Windows 11 hosts.
+Extends [SharedGL](https://github.com/dmaivel/sharedgl) to **Windows XP guests** and **Windows hosts**, and makes the Windows client faster and more robust. Direct3D 8/9 games on XP run on the host GPU through [WineD3D](https://github.com/JHRobotics/wine9x).
 
-Each change is a separate commit, so they can be reviewed and taken one at a time. In order of importance:
+Tested: FIFA 2004, GTA III, 3DMark 2001 SE (24,586 points); XP SP3 guest, RTX 3070, Linux and Windows 11 hosts.
+
+Each change is a separate commit, in order of importance.
 
 ### Added
 
-1. **Windows XP guests (new).** Upstream's Windows client targets Windows 10 and later. The client now also builds as a drop-in `opengl32.dll` for 32-bit XP, because XP's own `opengl32.dll` can't load an ICD through QEMU's QXL display driver. It comes with `kernel/winxp/sgldrv.sys`, a WDM driver for the ivshmem device (`ksgldrv` needs KMDF 1.15, which XP lacks), an INF and an installer. The driver maps the memory into each process through `\Device\PhysicalMemory`, because on XP an MDL can't describe 64 MiB or more. Frames reach the window through GDI from a separate thread with a triple buffer, so games don't wait for the slow GDI path, and are paced to the swap interval: 60 FPS for WineD3D games by default. The XP client connects in `wglCreateContext` rather than at DLL load, because GDI loads `opengl32.dll` into processes that never draw. Requests for 16-bit display modes are turned into 32-bit ones, because QEMU shows 16-bit QXL modes wrongly.
-2. **Windows hosts (new).** Upstream's server runs on Linux only. It now also builds and runs on Windows. The shared memory is a named Win32 file mapping, `Local\sharedgl_shared_memory`, and the server prints the matching QEMU arguments. QEMU on Windows has no ivshmem memory backend, so it needs a small extra device (`ivshmem-win`) that opens the mapping; that device is a QEMU patch and isn't part of this repository.
-3. **Much faster streaming buffer maps.** WineD3D maps vertex buffers hundreds of times per frame, and each map was a round trip to the host. Write-only maps now work on a client-side copy and send only the changed blocks. Invalidated maps need no reply, and large replies are copied in one piece instead of block by block.
-4. **Pixel buffer objects and missing functions:** pack/unpack buffer offsets, `glReadPixels`, `glDrawPixels`, `glGetCompressedTexImage`, `glGetBufferSubData` and `glSamplerParameter{i,f,Ii,Iui}v`.
-5. **Debugging and measurement aids**, all off by default: per-command profiling (`SGL_PROFILE`), frame times (`SGL_FRAMETIME`), shader dumps (`SGL_SHADERDUMP`), the last draw's state on a crash (`SGL_DRAWCHECK`), command traces, and logging of failed shader compiles and links.
+1. **Windows XP guests.**
+   - Drop-in `opengl32.dll` for 32-bit XP. XP's own `opengl32.dll` can't load an ICD through the QXL display driver.
+   - `kernel/winxp/sgldrv.sys`: WDM driver for ivshmem, with INF and installer (`ksgldrv` needs KMDF 1.15, which XP lacks). Maps the memory through `\Device\PhysicalMemory`, because an XP MDL can't describe 64 MiB or more.
+   - Frames are blitted with GDI from a separate thread with a triple buffer, so games don't wait for GDI.
+   - Frame rate cap set only by the host (`sglrenderer -f`, default 60). The game's swap interval is ignored.
+   - `sgldrv.sys` maps the QXL display memory write-back instead of uncached: each frame's blit gets about 10× cheaper on AMD hosts (`sglrenderer -q` turns it off).
+   - Connects in `wglCreateContext`, not at DLL load, because GDI loads `opengl32.dll` into processes that never draw.
+   - 16-bit display mode requests become 32-bit, because QEMU shows 16-bit QXL modes wrongly.
+2. **Windows hosts.** The server builds and runs on Windows. Shared memory is the named file mapping `Local\sharedgl_shared_memory`. QEMU for Windows has no ivshmem memory backend, so it needs the `ivshmem-win` device from qemu-xp-3d.
+3. **Faster streaming buffer maps.** WineD3D maps vertex buffers hundreds of times per frame, each a round trip. Write-only maps now use a client-side copy and send only changed blocks; invalidated maps need no reply; large replies come in one piece.
+4. **Pixel buffer objects and missing functions:** pack/unpack buffer offsets, `glReadPixels`, `glDrawPixels`, `glGetCompressedTexImage`, `glGetBufferSubData`, `glSamplerParameter{i,f,Ii,Iui}v`.
+5. **Debugging and measurement aids** (off by default): see the tables below, plus command traces and logging of failed shader compiles and links.
 
 ### Fixed
 
-1. **Several buffers mapped at once.** Client and server tracked only one mapping. A second map, such as a vertex and an index buffer locked together, sent the first buffer's data nowhere or into the wrong buffer. GTA III crashed about two seconds into driving.
-2. **Crash after deleting a buffer still used by an enabled vertex attribute**: the attribute fell back to buffer 0 and its offset was read as a memory address.
-3. **Heap corruption on flush and unmap**: data was copied through a stale mapping pointer.
-4. **`glCompressedTexSubImage1D/2D`**: the server read arguments the client never sends, which shifted all the others.
+1. **Several buffers mapped at once.** Only one mapping was tracked, so a second one (e.g. vertex and index buffer together) sent data to the wrong buffer. GTA III crashed two seconds into driving.
+2. **Deleted buffer still bound to an enabled vertex attribute** crashed: its offset was read as a memory address.
+3. **Heap corruption on flush and unmap** through a stale mapping pointer.
+4. **`glCompressedTexSubImage1D/2D`** read arguments the client never sends.
 5. **Uniform arrays**: every element went to the first element's location.
-6. Smaller fixes: frame readback no longer depends on the application's read framebuffer and pack state; `glBitmap` sends its floats as floats and the right bitmap size; 64-bit query results on Windows; `glGetError` looping forever without a current context on NVIDIA/Windows; the server handles `SIGTERM` and tells later clients when it has stopped.
+6. Smaller: frame readback no longer depends on the app's read framebuffer and pack state; `glBitmap` floats and size; 64-bit query results on Windows; `glGetError` looping without a current context on NVIDIA/Windows; the server handles `SIGTERM` and tells later clients it has stopped.
 
 ### Changed
 
-1. The server no longer spins a whole CPU core while waiting for commands. It spins for 1 ms, then naps.
-2. The client spins briefly and then sleeps while waiting for the server, instead of spinning without pause. `SGL_WAIT_MODE=original` selects the simpler loop.
-3. Windows clients map the shared memory write-back cached instead of write-combined, because reads from write-combined memory are uncached. They also look the device up by its interface class, which also works on XP, and fail cleanly when no server is running. **This affects Windows 10 guests too, and hasn't been tested there.**
-4. `inc/lzav.h` uses LF line endings like the rest of the tree.
+1. The server spins for 1 ms while waiting for commands, then naps, instead of using a whole core.
+2. The client spins briefly, then sleeps while waiting for the server (`SGL_WAIT_MODE=original`: the old loop).
+3. Windows clients map shared memory write-back instead of write-combined (write-combined reads are uncached), find the device by interface class (works on XP), and fail cleanly with no server. **Affects Windows 10 guests too; untested there.**
+4. `inc/lzav.h` uses LF line endings.
 
-### Removed
+### New server options
 
-Nothing.
+| Option | Effect |
+|---|---|
+| `-f FPS` | Frame cap for XP clients, `0` = none. Default 60. Read by the client from shared memory every frame |
+| `-q` | Leave XP's QXL display memory uncached |
 
 ### New environment variables
 
 | Variable | Where | Effect |
 |---|---|---|
-| `SGL_MAX_FPS` | XP guest | Frame limit; `0` turns it off. The default follows the swap interval, or 60 for WineD3D games |
-| `SGL_SYNC_PRESENT=true` | XP guest | Show frames from the game's own thread instead of a separate one |
-| `SGL_ALLOW_16BPP=true` | XP guest | Let programs switch to 16-bit display modes |
+| `SGL_SYNC_PRESENT=true` | XP guest | Blit from the game's thread instead of a separate one |
+| `SGL_ALLOW_16BPP=true` | XP guest | Allow 16-bit display modes |
 | `SGL_STATS` | XP guest | Log frame rates, unimplemented functions and crash addresses to `%TEMP%\sharedgl.log` |
-| `SGL_CLIENT_PROFILE` | XP guest | Record client-side timings in shared memory |
-| `SGL_WAIT_MODE=original` | Windows guests | Use the simpler wait loop |
-| `SGL_NO_SHADOW_MAPS` | Guest | Turn off the client-side copies for streaming buffer maps |
-| `SGL_SMALL_DOWNLOADS` | Guest | Turn off downloads in one piece |
-| `SGL_DEFER_MAPS` | Guest | Experimental: send only the flushed ranges of a map. Off by default |
-| `SGL_PROFILE` | Server | Time per command, waiting and context switches, written to `sgl_profile.txt` every 5 s |
-| `SGL_FRAMETIME` | Server | Microseconds between swaps, written to `sgl_frametime.log` |
-| `SGL_SHADERDUMP` | Server | Each program's shaders, before linking, written to `sgl_shaders.txt` |
-| `SGL_DRAWCHECK` | Server | Print the last draw's vertex arrays if the server crashes |
+| `SGL_CLIENT_PROFILE` | XP guest | Record client timings in shared memory |
+| `SGL_WAIT_MODE=original` | Windows guests | Old wait loop |
+| `SGL_NO_SHADOW_MAPS` | Guest | No client-side copies for streaming maps |
+| `SGL_SMALL_DOWNLOADS` | Guest | No one-piece downloads |
+| `SGL_DEFER_MAPS` | Guest | Experimental: send only flushed ranges of a map |
+| `SGL_PROFILE` | Server | Time per command, waits and context switches, to `sgl_profile.txt` every 5 s |
+| `SGL_FRAMEPROF` | Server | Per-frame guest and host timings to a CSV; see qemu-xp-3d's `PROFILING.md` |
+| `SGL_FRAMETIME` | Server | Microseconds between swaps, to `sgl_frametime.log` |
+| `SGL_SHADERDUMP` | Server | Shaders of each program, to `sgl_shaders.txt` |
+| `SGL_DRAWCHECK` | Server | Print the last draw's vertex arrays on a crash |
 
-The server also writes the frame rate of the last 5 s to `sgl_fps`, and traces that many frames of commands to `sgl_trace.log` when a number is written to `sgl_trace_frames`. These files are in `/dev/shm` on Linux, and in the working folder on Windows.
+The server also writes the last 5 s frame rate to `sgl_fps`, and traces N frames of commands to `sgl_trace.log` when N is written to `sgl_trace_frames`. These files are in `/dev/shm` on Linux, the working folder on Windows.
 
 ### Building the new parts
 
-CMake builds the Linux server and client as before. The XP client and driver, and the Windows server, are built with MinGW GCC directly:
+CMake builds the Linux server and client as before. The XP client and driver and the Windows server use MinGW GCC directly (qemu-xp-3d's Makefile does all of this):
 
 ```sh
 # XP client and driver (Linux: i686-w64-mingw32-gcc; MSYS2: the MINGW32 gcc)
@@ -78,12 +90,13 @@ $CC -O2 -s -march=pentium2 -w -fno-stack-protector -fno-stack-check -fno-aggress
 $CC $CFLAGS -o sglinstall.exe kernel/winxp/sglinstall.c -lnewdev -static-libgcc
 
 # Windows server (MSYS2 MINGW64 shell)
-gcc -O2 -std=gnu17 -w -DSDL_MAIN_HANDLED -Iinc src/server/context.c src/server/dynarr.c src/server/main.c \
-    src/server/overlay.c src/server/processor.c src/server/sgldebug.c src/client/scratch.c \
+gcc -O2 -std=gnu17 -w -DSDL_MAIN_HANDLED -Iinc src/server/context.c src/server/dynarr.c src/server/frameprof.c \
+    src/server/main.c src/server/overlay.c src/server/processor.c src/server/sgldebug.c src/client/scratch.c \
     -o sglrenderer.exe -lSDL2 -lepoxy -lws2_32 -lwinmm -liphlpapi
 ```
 
-In XP, put `sgldrv.sys`, `sgldrv.inf` and `sglinstall.exe` in one folder and run `sglinstall.exe`, then copy `opengl32.dll` next to the game's executable. On MSYS2 the driver's `-I` is `/mingw32/include/ddk`. MSYS2's GCC defaults to C23, which this code doesn't compile as, so add `-std=gnu17` to all of these commands there, and `-D__USE_MINGW_ANSI_STDIO=0` to `CFLAGS`, so the client uses XP's own `printf`.
+- **XP install:** put `sgldrv.sys`, `sgldrv.inf` and `sglinstall.exe` in one folder, run `sglinstall.exe`, and copy `opengl32.dll` next to the game's executable.
+- **MSYS2:** the driver's `-I` is `/mingw32/include/ddk`. Add `-std=gnu17` to every command (GCC defaults to C23, which this code doesn't compile as), and `-D__USE_MINGW_ANSI_STDIO=0` to `CFLAGS` so the client uses XP's own `printf`.
 
 ---
 

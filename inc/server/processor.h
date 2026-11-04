@@ -24,6 +24,12 @@ struct sgl_cmd_processor_args {
     int gl_minor;
 
     /*
+     * guest settings, published in SGL_OFFSET_REGISTER_FPS_CAP / _GUEST_FLAGS
+     */
+    int fps_cap;
+    int guest_flags;
+
+    /*
      * for debugging; in the event of an exception,
      * this pointer will contain a pointer to the
      * current command in execution

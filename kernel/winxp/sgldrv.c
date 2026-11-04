@@ -18,6 +18,8 @@ DEFINE_GUID(GUID_DEVINTERFACE_IVSHMEM,
 #define IOCTL_IVSHMEM_REQUEST_SIZE CTL_CODE(FILE_DEVICE_UNKNOWN, 0x801, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_IVSHMEM_REQUEST_MMAP CTL_CODE(FILE_DEVICE_UNKNOWN, 0x802, METHOD_BUFFERED, FILE_ANY_ACCESS)
 #define IOCTL_IVSHMEM_RELEASE_MMAP CTL_CODE(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, FILE_ANY_ACCESS)
+/* SharedGL's own: map the QXL display card's memory write-back, see SglCacheQxl() */
+#define IOCTL_SGL_CACHE_QXL        CTL_CODE(FILE_DEVICE_UNKNOWN, 0x810, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
 #define IVSHMEM_CACHE_NONCACHED     0
 #define IVSHMEM_CACHE_CACHED        1
@@ -243,6 +245,175 @@ static NTSTATUS SglMap(SGL_DEVICE *Ext, PFILE_OBJECT File, UCHAR CacheMode, SGL_
     return STATUS_SUCCESS;
 }
 
+/*
+ * The QXL display driver maps the card's memory uncached (PCD+PWT in its page table
+ * entries). Under KVM on an AMD host that is honoured, so every store of a frame into
+ * the card is a separate trip to memory: a 1024x768 GDI blit costs about 24 ms of
+ * guest CPU. In QEMU that memory is ordinary RAM, coherent with the host, so
+ * write-back is safe, and it brings the blit down to a plain memcpy.
+ *
+ * This finds the card on PCI bus 0, takes each of its memory BARs up to the next BAR
+ * of any device on the bus (sizing a BAR would mean rewriting it while the display
+ * driver uses it), and clears PCD/PWT in every kernel mapping that points into one.
+ * Only system space is changed, which is where the QXL drivers map the card.
+ * Calling it again is harmless and catches mappings made since, such as after a
+ * mode change.
+ */
+#define SGL_MAX_RANGES 8
+
+typedef struct _SGL_CACHE_RESULT {
+    ULONG Ranges;      /* QXL memory BARs found */
+    ULONG Patched;     /* page table entries changed */
+    ULONG Already;     /* entries into the card that were already cached */
+    ULONG Pae;
+} SGL_CACHE_RESULT;
+
+static ULONG SglQxlRanges(ULONGLONG *Start, ULONGLONG *End)
+{
+    ULONGLONG bases[32 * 6];
+    ULONG nbases = 0, nranges = 0, slot, i, j;
+
+    for (slot = 0; slot < 32; slot++) {
+        ULONG cfg[10];
+        if (HalGetBusDataByOffset(PCIConfiguration, 0, slot, cfg, 0, sizeof(cfg)) != sizeof(cfg))
+            continue;
+        if ((cfg[0] & 0xffff) == 0xffff || (cfg[3] >> 16 & 0x7f) != 0)
+            continue; /* empty slot, or not a plain device (a bridge has 2 BARs) */
+        BOOLEAN qxl = cfg[0] == 0x01001b36;
+        for (i = 0; i < 6; i++) {
+            ULONG bar = cfg[4 + i];
+            ULONGLONG base;
+            if (bar & 1)
+                continue; /* I/O */
+            base = bar & ~0xfu;
+            if ((bar & 6) == 4 && i < 5)
+                base |= (ULONGLONG)cfg[4 + ++i] << 32;
+            if (base == 0)
+                continue;
+            bases[nbases++] = base;
+            if (qxl && nranges < SGL_MAX_RANGES) {
+                Start[nranges] = base;
+                End[nranges++] = 0;
+            }
+        }
+    }
+
+    for (i = 0; i < nranges; i++) {
+        ULONGLONG end = Start[i] + 0x20000000; /* no QXL BAR is bigger */
+        for (j = 0; j < nbases; j++)
+            if (bases[j] > Start[i] && bases[j] < end)
+                end = bases[j];
+        if (end > 0xfec00000 && Start[i] < 0xfec00000)
+            end = 0xfec00000; /* never the APICs */
+        End[i] = end;
+    }
+    return nranges;
+}
+
+static BOOLEAN SglInRanges(ULONGLONG Address, const ULONGLONG *Start, const ULONGLONG *End, ULONG Count)
+{
+    ULONG i;
+    for (i = 0; i < Count; i++)
+        if (Address >= Start[i] && Address < End[i])
+            return TRUE;
+    return FALSE;
+}
+
+static ULONG SglReadCr4(void)
+{
+    ULONG value;
+    __asm__ __volatile__("mov %%cr4, %0" : "=r"(value));
+    return value;
+}
+
+/* Toggling CR4.PGE flushes the whole TLB, global entries included. */
+static void SglFlushTlb(void)
+{
+    ULONG cr4;
+    __asm__ __volatile__("pushf; cli; mov %%cr4, %0; xorl $0x80, %0; mov %0, %%cr4; xorl $0x80, %0; mov %0, %%cr4; popf"
+                         : "=&r"(cr4) :: "memory");
+}
+
+#define SGL_PCD_PWT 0x18
+
+static void SglCacheQxl(SGL_CACHE_RESULT *Result)
+{
+    ULONGLONG start[SGL_MAX_RANGES], end[SGL_MAX_RANGES];
+    ULONG va, cpu;
+    KAFFINITY active;
+    BOOLEAN pae = (SglReadCr4() & 0x20) != 0;
+
+    RtlZeroMemory(Result, sizeof(*Result));
+    Result->Pae = pae;
+    Result->Ranges = SglQxlRanges(start, end);
+    if (Result->Ranges == 0)
+        return;
+
+    /* The page tables are mapped at 0xC0000000 (PTEs) and just above (PDEs). */
+    for (va = 0x80000000u; va >= 0x80000000u; ) {
+        ULONG step = pae ? 0x200000 : 0x400000;
+        if (pae) {
+            volatile ULONGLONG *pde = (ULONGLONG*)(0xC0600000u + (va >> 21) * 8);
+            ULONGLONG e = *pde;
+            if (e & 1) {
+                if (e & 0x80) {
+                    if (SglInRanges(e & 0xfffffffe00000ull, start, end, Result->Ranges)) {
+                        if (e & SGL_PCD_PWT) { *pde = e & ~(ULONGLONG)SGL_PCD_PWT; Result->Patched++; }
+                        else Result->Already++;
+                    }
+                }
+                else {
+                    volatile ULONGLONG *pte = (ULONGLONG*)(0xC0000000u + (va >> 12) * 8);
+                    ULONG k;
+                    for (k = 0; k < 512; k++) {
+                        ULONGLONG t = pte[k];
+                        if ((t & 1) && SglInRanges(t & 0xffffffffff000ull, start, end, Result->Ranges)) {
+                            if (t & SGL_PCD_PWT) { pte[k] = t & ~(ULONGLONG)SGL_PCD_PWT; Result->Patched++; }
+                            else Result->Already++;
+                        }
+                    }
+                }
+            }
+        }
+        else {
+            volatile ULONG *pde = (ULONG*)(0xC0300000u + (va >> 22) * 4);
+            ULONG e = *pde;
+            if (e & 1) {
+                if (e & 0x80) {
+                    if (SglInRanges(e & 0xffc00000u, start, end, Result->Ranges)) {
+                        if (e & SGL_PCD_PWT) { *pde = e & ~SGL_PCD_PWT; Result->Patched++; }
+                        else Result->Already++;
+                    }
+                }
+                else {
+                    volatile ULONG *pte = (ULONG*)(0xC0000000u + (va >> 12) * 4);
+                    ULONG k;
+                    for (k = 0; k < 1024; k++) {
+                        ULONG t = pte[k];
+                        if ((t & 1) && SglInRanges(t & 0xfffff000u, start, end, Result->Ranges)) {
+                            if (t & SGL_PCD_PWT) { pte[k] = t & ~SGL_PCD_PWT; Result->Patched++; }
+                            else Result->Already++;
+                        }
+                    }
+                }
+            }
+        }
+        va += step;
+    }
+
+    if (Result->Patched == 0)
+        return;
+    /* The memory was uncached, so no cache holds stale lines of it: a TLB flush is enough. */
+    active = KeQueryActiveProcessors();
+    for (cpu = 0; cpu < sizeof(KAFFINITY) * 8; cpu++) {
+        if (!(active & ((KAFFINITY)1 << cpu)))
+            continue;
+        KeSetSystemAffinityThread((KAFFINITY)1 << cpu);
+        SglFlushTlb();
+    }
+    KeRevertToUserAffinityThread();
+}
+
 static NTSTATUS NTAPI SglDeviceControl(PDEVICE_OBJECT Device, PIRP Irp)
 {
     SGL_DEVICE *ext = Device->DeviceExtension;
@@ -276,6 +447,18 @@ static NTSTATUS NTAPI SglDeviceControl(PDEVICE_OBJECT Device, PIRP Irp)
 
     case IOCTL_IVSHMEM_RELEASE_MMAP:
         return SglComplete(Irp, SglUnmap(stack->FileObject), 0);
+
+    case IOCTL_SGL_CACHE_QXL: {
+        SGL_CACHE_RESULT result;
+        if (out_length < sizeof(result))
+            return SglComplete(Irp, STATUS_INVALID_BUFFER_SIZE, 0);
+        SglCacheQxl(&result);
+        SglReport(L"QxlRanges", result.Ranges);
+        SglReport(L"QxlPatched", result.Patched);
+        SglReport(L"QxlAlready", result.Already);
+        RtlCopyMemory(buffer, &result, sizeof(result));
+        return SglComplete(Irp, STATUS_SUCCESS, sizeof(result));
+    }
 
     default:
         return SglComplete(Irp, STATUS_INVALID_DEVICE_REQUEST, 0);

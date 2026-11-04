@@ -5,6 +5,7 @@
 #include <server/dynarr.h>
 #include <server/processor.h>
 #include <sgldebug.h>
+#include <server/frameprof.h>
 
 #define ENET_IMPLEMENTATION
 #ifdef _WIN32
@@ -247,10 +248,13 @@ static FORCEINLINE inline void wait_shm(void *p, int *client_id, size_t *submit_
             /* Windows cannot sleep for 50us: the shortest sleep is a whole timer tick. */
             if (idle_us < 5000)
                 _mm_pause();
-            else
+            else {
+                sgl_frameprof_host[SGL_FP_SLEEPS]++;
                 Sleep(1);
+            }
 #else
             struct timespec nap = { 0, idle_us < 5000 ? 50000 : 1000000 };
+            sgl_frameprof_host[SGL_FP_SLEEPS]++;
             nanosleep(&nap, NULL);
 #endif
         }
@@ -631,6 +635,11 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
     *(int*)((char*)shared + SGL_OFFSET_REGISTER_FIFO_SIZE) = (int)fifo_size;
     *(int*)((char*)shared + SGL_OFFSET_REGISTER_MAX_CLIENTS) = SGL_MAX_CLIENTS;
     *(int*)((char*)shared + SGL_OFFSET_REGISTER_CAPABILITIES) = SGL_CAP_BULK_DOWNLOAD;
+    *(int*)((char*)shared + SGL_OFFSET_REGISTER_FPS_CAP) = SGL_FPS_CAP_SET | (args.fps_cap & SGL_FPS_CAP_MASK);
+    *(int*)((char*)shared + SGL_OFFSET_REGISTER_GUEST_FLAGS) = args.guest_flags;
+    sgl_frameprof_init(shared);
+    uint64_t fp_mark = 0, fp_readback = 0;
+    bool fp_swapped = false;
 
     if (args.internal_cmd_ptr)
         *args.internal_cmd_ptr = &cmd;
@@ -665,6 +674,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
 
     while (1) {
         if (profile) prof_mark = SDL_GetPerformanceCounter();
+        if (sgl_frameprof_on) fp_mark = sgl_tsc();
         int client_id = 0;
         size_t submit_size = 0;
         struct sgl_host_context *net_ctx = NULL;
@@ -682,6 +692,13 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             prof_wait += now - prof_mark;
             prof_mark = now;
             prof_submits++;
+        }
+        if (sgl_frameprof_on) {
+            uint64_t now = sgl_tsc();
+            sgl_frameprof_host[SGL_FP_WAIT] += now - fp_mark;
+            sgl_frameprof_host[SGL_FP_SUBMITS]++;
+            sgl_frameprof_host[SGL_FP_BYTES] += submit_size;
+            fp_mark = now;
         }
 
         if (!args.network_over_shared) {
@@ -715,6 +732,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             sgl_set_current(net_ctx);
 
         if (profile) prof_context += SDL_GetPerformanceCounter() - prof_mark;
+        if (sgl_frameprof_on) sgl_frameprof_host[SGL_FP_SETUP] += sgl_tsc() - fp_mark;
         
         int *pb = (int*)(p + SGL_OFFSET_COMMAND_START);
         char *cmd_base = p + SGL_OFFSET_COMMAND_START;
@@ -722,6 +740,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
         // int track = 0;
         while (*pb != SGL_CMD_INVALID) {
             if (profile) prof_mark = SDL_GetPerformanceCounter();
+            if (sgl_frameprof_on) fp_mark = sgl_tsc();
             cmd = *pb;
             sgl_trace_command(cmd, pb);
             // printf("[%-5d] command: %s (%d)\n", track++, sgl_cmd2str(*pb), *pb); fflush(stdout);
@@ -761,7 +780,10 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                     format = *pb++;
 
                 void *framebuffer_target = (char*)shared + (*(uint64_t*)((char*)shared + SGL_OFFSET_REGISTER_FBSTART));
+                uint64_t fp_read_start = sgl_tsc();
                 sgl_read_pixels(w, h, framebuffer_target, vflip, format, (size_t)pb - (size_t)cmd_base);
+                fp_readback = sgl_tsc() - fp_read_start;
+                fp_swapped = true;
                 {
                     /* the current frame rate, for anyone who wants to read it */
                     static int swaps;
@@ -6704,6 +6726,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 break;
             }
             }
+            uint64_t fp_executed = sgl_frameprof_on ? sgl_tsc() : 0;
             if (profile && cmd >= 0 && cmd < SGL_CMD_MAX) {
                 uint64_t now = SDL_GetPerformanceCounter();
                 prof_commands[cmd]++;
@@ -6717,6 +6740,19 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                     PRINT_LOG("gl error (%d / 0x%04x) on client %d from %s (%d)\n", error, error, client_id, sgl_cmd2str(cmd), cmd);
             }
             if (profile) prof_errors += SDL_GetPerformanceCounter() - prof_mark;
+            if (sgl_frameprof_on) {
+                uint64_t now = sgl_tsc();
+                sgl_frameprof_command(cmd, fp_executed - fp_mark);
+                sgl_frameprof_host[SGL_FP_EXEC] += fp_executed - fp_mark - fp_readback;
+                sgl_frameprof_host[SGL_FP_READBACK] += fp_readback;
+                sgl_frameprof_host[SGL_FP_ERRCHECK] += now - fp_executed;
+                sgl_frameprof_host[SGL_FP_COMMANDS]++;
+                fp_readback = 0;
+                if (fp_swapped)
+                    sgl_frameprof_swap(shared);
+            }
+            fp_swapped = false;
+            fp_readback = 0;
         }
 
         /* 

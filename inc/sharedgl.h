@@ -47,6 +47,16 @@
 #define SGL_OFFSET_REGISTER_MAX_CLIENTS         (sizeof(int) * 17)
 #define SGL_OFFSET_REGISTER_CAPABILITIES        (sizeof(int) * 18)
 #define SGL_CAP_BULK_DOWNLOAD                   1
+/*
+ * Guest settings that only the host decides (sglrenderer -f and -q). The server writes
+ * them before any client connects; the client never takes them from the application.
+ */
+#define SGL_OFFSET_REGISTER_FPS_CAP             (sizeof(int) * 19)
+#define SGL_FPS_CAP_SET                         0x40000000  /* missing: the server predates this register */
+#define SGL_FPS_CAP_MASK                        0xffff      /* frames per second, 0 = unlimited */
+#define SGL_FPS_CAP_DEFAULT                     60
+#define SGL_OFFSET_REGISTER_GUEST_FLAGS         (sizeof(int) * 20)
+#define SGL_GUEST_NO_QXL_CACHE                  1           /* leave the QXL display memory uncached */
 #define SGL_OFFSET_COMMAND_START                0x1000
 
 #define SGL_CLIENT_SLOT_SIZE                    SGL_OFFSET_COMMAND_START
