@@ -280,7 +280,8 @@ static void xpwgl_pace(void)
 
 static BOOL xp_present(HDC hdc)
 {
-    unsigned long long prof_begin = __rdtsc(), prof_pace;
+    unsigned long long prof_begin = __rdtsc(), prof_pace, pace_ticks = 0;
+    BOOL paced = FALSE;
     HWND window = WindowFromDC(hdc);
     const char *source;
     int width = real_width, height = real_height;
@@ -336,6 +337,18 @@ static BOOL xp_present(HDC hdc)
         frame->width = width;
         frame->height = height;
 
+        /*
+         * Wait for the frame's slot before showing it, not after. Waiting after
+         * spaces out the starts of frames, and each one then appears whenever its
+         * rendering happens to finish: a few ms early or late every frame, which
+         * shows as judder and double images in motion. Waiting here shows frames
+         * at even intervals, and the next one starts right after, also evenly.
+         */
+        prof_pace = __rdtsc();
+        xpwgl_pace();
+        pace_ticks = __rdtsc() - prof_pace;
+        paced = TRUE;
+
         EnterCriticalSection(&xpwgl_present_lock);
         xpwgl_back = xpwgl_ready;
         xpwgl_ready = frame;
@@ -345,14 +358,18 @@ static BOOL xp_present(HDC hdc)
     }
 
     xpwgl_stats();
-    prof_pace = __rdtsc();
-    xpwgl_pace();
+    if (!paced) {
+        /* the synchronous blit has shown the frame already */
+        prof_pace = __rdtsc();
+        xpwgl_pace();
+        pace_ticks = __rdtsc() - prof_pace;
+    }
     glimpl_profile_record(2, __rdtsc() - prof_begin);
     glimpl_profile_record(3, 1);
-    glimpl_profile_record(4, __rdtsc() - prof_pace);
+    glimpl_profile_record(4, pace_ticks);
     if (frame_prof) {
         frame_prof->counter[SGL_PROF_G_SWAP_COPY] += (uint32_t)(prof_pace - prof_swapped);
-        frame_prof->counter[SGL_PROF_G_PACE] += (uint32_t)(__rdtsc() - prof_pace);
+        frame_prof->counter[SGL_PROF_G_PACE] += (uint32_t)pace_ticks;
     }
     return TRUE;
 }

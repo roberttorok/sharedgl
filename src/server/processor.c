@@ -192,6 +192,14 @@ static FORCEINLINE inline int64_t pb_next_i64(int **pb)
     return value;
 }
 
+#ifdef _WIN32
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
+/* for the short naps in wait_shm; NULL when the system has no high-resolution timers */
+static HANDLE nap_timer = NULL;
+#endif
+
 static FORCEINLINE inline void wait_shm(void *p, int *client_id, size_t *submit_size)
 {
     int64_t idle_since_us = 0;
@@ -245,8 +253,22 @@ static FORCEINLINE inline void wait_shm(void *p, int *client_id, size_t *submit_
         }
         else {
 #ifdef _WIN32
-            /* Windows cannot sleep for 50us: the shortest sleep is a whole timer tick. */
-            if (idle_us < 5000)
+            /*
+             * Sleep(1) takes ~2ms even with timeBeginPeriod(1), too long between the
+             * commands of a frame. A high-resolution waitable timer wakes after ~0.5ms
+             * (the shortest it can do), so nap with that like Linux does. Without one
+             * (Windows older than 10 1803) spin up to 5ms, then Sleep(1).
+             */
+            if (nap_timer != NULL) {
+                LARGE_INTEGER due;
+                due.QuadPart = idle_us < 5000 ? -500 : -10000;  /* 100ns units, relative */
+                sgl_frameprof_host[SGL_FP_SLEEPS]++;
+                if (SetWaitableTimer(nap_timer, &due, 0, NULL, NULL, FALSE))
+                    WaitForSingleObject(nap_timer, INFINITE);
+                else
+                    Sleep(1);
+            }
+            else if (idle_us < 5000)
                 _mm_pause();
             else {
                 sgl_frameprof_host[SGL_FP_SLEEPS]++;
@@ -603,6 +625,10 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
     /* short naps in wait_shm should really be short */
 #ifdef _WIN32
     timeBeginPeriod(1);
+    nap_timer = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+    if (nap_timer == NULL) {
+        PRINT_LOG("no high-resolution timer, idle waits will spin more\n");
+    }
 #else
     prctl(PR_SET_TIMERSLACK, 1000UL);
 #endif
