@@ -58,7 +58,38 @@ struct sgl_prof_shared * SGL_INTERNAL glimpl_prof(void)
     }
     return prof;
 }
+
+/* in platform/xpwgl.inl: shows the window's image, as SwapBuffers does */
+void SGL_INTERNAL xpwgl_present_front(void);
 #endif
+
+/*
+ * Where drawing to the window goes. Wine's DirectDraw shows a primary surface by
+ * drawing it into the window's front buffer and calling glFlush, with no
+ * SwapBuffers, so glFlush and glFinish present the frame while the front buffer
+ * is the target (the server draws it into the image it shows: see
+ * sgl_window_buffer there). The server keeps one context per process, so one
+ * copy of this state is enough.
+ */
+static GLenum glimpl_window_draw_buffer = GL_BACK;
+static GLuint glimpl_draw_framebuffer = 0;
+
+static bool glimpl_drawing_to_front(void)
+{
+    if (glimpl_draw_framebuffer != 0)
+        return false;
+    switch (glimpl_window_draw_buffer) {
+    case GL_FRONT:
+    case GL_FRONT_AND_BACK:
+    case GL_FRONT_LEFT:
+    case GL_FRONT_RIGHT:
+    case GL_LEFT:
+    case GL_RIGHT:
+        return true;
+    default:
+        return false;
+    }
+}
 
 #ifndef _WIN32
 #include <sys/mman.h>
@@ -2365,6 +2396,8 @@ void glDrawArrays(GLenum mode, GLint first, GLsizei count)
 
 void glDrawBuffer(GLenum buf)
 {
+    if (glimpl_draw_framebuffer == 0)
+        glimpl_window_draw_buffer = buf;
     pb_push(SGL_CMD_DRAWBUFFER);
     pb_push(buf);
 }
@@ -3205,11 +3238,19 @@ void glDepthMask(GLboolean flag)
 void glFinish(void)
 {
     pb_push(SGL_CMD_FINISH);
+#ifdef SGL_XP
+    if (glimpl_drawing_to_front())
+        xpwgl_present_front();
+#endif
 }
 
 void glFlush(void)
 {
     pb_push(SGL_CMD_FLUSH);
+#ifdef SGL_XP
+    if (glimpl_drawing_to_front())
+        xpwgl_present_front();
+#endif
 }
 
 void glLogicOp(GLenum opcode)
@@ -5234,6 +5275,8 @@ GLboolean glIsFramebuffer(GLuint framebuffer)
 
 void glBindFramebuffer(GLenum target, GLuint framebuffer)
 {
+    if (target == GL_FRAMEBUFFER || target == GL_DRAW_FRAMEBUFFER)
+        glimpl_draw_framebuffer = framebuffer;
     pb_push(SGL_CMD_BINDFRAMEBUFFER);
     pb_push(target);
     pb_push(framebuffer);
@@ -8332,6 +8375,8 @@ void glGetBufferPointerv(GLenum target, GLenum pname, void* *params)
 
 void glDrawBuffers(GLsizei n, const GLenum* bufs)
 {
+    if (glimpl_draw_framebuffer == 0 && n > 0)
+        glimpl_window_draw_buffer = bufs[0];
     pb_push(SGL_CMD_DRAWBUFFERS);
     pb_push(n);
     for (int i = 0; i < n; i++)
@@ -8877,6 +8922,9 @@ void glGetRenderbufferParameteriv(GLenum target, GLenum pname, GLint* params)
 void glDeleteFramebuffers(GLsizei n, const GLuint* framebuffers)
 {
     for (int i = 0; i < n; i++) {
+        /* deleting the bound framebuffer binds the window's again */
+        if (framebuffers[i] != 0 && framebuffers[i] == glimpl_draw_framebuffer)
+            glimpl_draw_framebuffer = 0;
         pb_push(SGL_CMD_DELETEFRAMEBUFFERS);
         // pb_push(1);
         pb_push(framebuffers[i]);

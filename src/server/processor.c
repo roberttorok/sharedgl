@@ -65,6 +65,46 @@ static inline void sgl_spin_unlock(int volatile *lock)
     if ((((*pb) & 0xFF) == 0 || ((*pb >> 8) & 0xFF) == 0 || ((*pb >> 16) & 0xFF) == 0 || ((*pb >> 24) & 0xFF) == 0)) \
         pb++;
 
+/*
+ * The server never swaps its window: the back buffer always holds the newest
+ * image, and SwapBuffers reads the frame out of it. So the window's front buffer
+ * is the back buffer. Clients that draw straight to the front buffer and only
+ * glFlush, as Wine's DirectDraw does for a primary surface, then draw into the
+ * image that is shown. `binding` is the framebuffer binding to check: an FBO's
+ * buffers are left alone.
+ */
+static GLenum sgl_window_buffer(GLenum buf, GLenum binding)
+{
+    GLint framebuffer = 0;
+
+    switch (buf) {
+    case GL_FRONT:
+    case GL_FRONT_AND_BACK:
+    case GL_FRONT_LEFT:
+    case GL_FRONT_RIGHT:
+    case GL_LEFT:
+    case GL_RIGHT:
+        break;
+    default:
+        return buf;
+    }
+
+    glGetIntegerv(binding, &framebuffer);
+    if (framebuffer != 0)
+        return buf;
+
+    switch (buf) {
+    case GL_FRONT_LEFT:
+    case GL_LEFT:
+        return GL_BACK_LEFT;
+    case GL_FRONT_RIGHT:
+    case GL_RIGHT:
+        return GL_BACK_RIGHT;
+    default:
+        return GL_BACK;
+    }
+}
+
 static void read_counted_strings(int **pb, int count, const char **strings, int *lengths)
 {
     for (int i = 0; i < count; i++) {
@@ -1054,7 +1094,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 break;
             }
             case SGL_CMD_DRAWBUFFER:
-                glDrawBuffer(*pb++);
+                glDrawBuffer(sgl_window_buffer(*pb++, GL_DRAW_FRAMEBUFFER_BINDING));
                 break;
             case SGL_CMD_DRAWELEMENTS: {
                 int mode = *pb++,
@@ -1660,7 +1700,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             }
             case SGL_CMD_READBUFFER: {
                 int src = *pb++;
-                glReadBuffer(src);
+                glReadBuffer(sgl_window_buffer(src, GL_READ_FRAMEBUFFER_BINDING));
                 break;
             }
             case SGL_CMD_ISENABLED: {
@@ -5459,7 +5499,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 int n = *pb++;
                 unsigned int bufs[n];
                 for (int i = 0; i < n; i++)
-                    bufs[i] = *pb++;
+                    bufs[i] = sgl_window_buffer(*pb++, GL_DRAW_FRAMEBUFFER_BINDING);
                 glDrawBuffers(n, bufs);
                 break;
             }

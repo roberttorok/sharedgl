@@ -375,6 +375,30 @@ static BOOL xp_present(HDC hdc)
 }
 
 /*
+ * glFlush or glFinish while drawing to the window's front buffer: Wine's DirectDraw
+ * showing a Flip or a Blt to the primary surface. Show the image, as SwapBuffers would,
+ * paced like one: a Flip waits for the next frame on real hardware too. Without this
+ * nothing is ever submitted: the commands pile up until the push buffer overflows.
+ */
+void SGL_INTERNAL xpwgl_present_front(void)
+{
+    static LONG busy;
+    HDC hdc;
+
+    if (!glimpl_is_ready())
+        return;
+    xpwgl_tls_init();
+    hdc = (HDC)TlsGetValue(xpwgl_tls_dc);
+    if (hdc == NULL)
+        return;
+    /* xp_present itself calls glFlush for a minimized window */
+    if (InterlockedExchange(&busy, 1) != 0)
+        return;
+    xp_present(hdc);
+    InterlockedExchange(&busy, 0);
+}
+
+/*
  * With SGL_STATS set, a crash writes its address and the code addresses found on
  * the stack to sharedgl.log. Windows XP has no other record of these.
  */

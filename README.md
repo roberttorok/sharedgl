@@ -4,7 +4,7 @@
 
 Extends [SharedGL](https://github.com/dmaivel/sharedgl) to **Windows XP guests** and **Windows hosts**, and makes the Windows client faster and more robust. Direct3D 8/9 games on XP run on the host GPU through [WineD3D](https://github.com/JHRobotics/wine9x).
 
-Tested: FIFA 2004, GTA III, 3DMark 2001 SE (24,586 points); XP SP3 guest, RTX 3070, Linux and Windows 11 hosts.
+Tested: FIFA 2004, GTA III, NBA Live 2001 demo, 3DMark 2001 SE (24,586 points); XP SP3 guest, RTX 3070, Linux and Windows 11 hosts.
 
 Each change is a separate commit, in order of importance.
 
@@ -26,11 +26,12 @@ Each change is a separate commit, in order of importance.
 ### Fixed
 
 1. **Several buffers mapped at once.** Only one mapping was tracked, so a second one (e.g. vertex and index buffer together) sent data to the wrong buffer. GTA III crashed two seconds into driving.
-2. **Deleted buffer still bound to an enabled vertex attribute** crashed: its offset was read as a memory address.
-3. **Heap corruption on flush and unmap** through a stale mapping pointer.
-4. **`glCompressedTexSubImage1D/2D`** read arguments the client never sends.
-5. **Uniform arrays**: every element went to the first element's location.
-6. Smaller: frame readback no longer depends on the app's read framebuffer and pack state; `glBitmap` floats and size; 64-bit query results on Windows; `glGetError` looping without a current context on NVIDIA/Windows; the server handles `SIGTERM` and tells later clients it has stopped.
+2. **DirectDraw and Direct3D 7 games were black.** WineD3D shows them by drawing to the front buffer and calling `glFlush`, never `SwapBuffers`. On XP, `glFlush`/`glFinish` while drawing to the front buffer now present the frame, and the server maps the window's front buffer to its back buffer.
+3. **Deleted buffer still bound to an enabled vertex attribute** crashed: its offset was read as a memory address.
+4. **Heap corruption on flush and unmap** through a stale mapping pointer.
+5. **`glCompressedTexSubImage1D/2D`** read arguments the client never sends.
+6. **Uniform arrays**: every element went to the first element's location.
+7. Smaller: frame readback no longer depends on the app's read framebuffer and pack state; `glBitmap` floats and size; 64-bit query results on Windows; `glGetError` looping without a current context on NVIDIA/Windows; the server handles `SIGTERM` and tells later clients it has stopped.
 
 ### Changed
 
