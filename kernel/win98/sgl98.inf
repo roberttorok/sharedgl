@@ -1,0 +1,42 @@
+; SharedGL shared-memory driver for Windows 98 SE.
+; Point the Add New Hardware wizard (or Device Manager's Update Driver) at the
+; folder holding this file and sgl98.sys.
+
+[Version]
+Signature="$CHICAGO$"
+Class=System
+ClassGUID={4d36e97d-e325-11ce-bfc1-08002be10318}
+Provider=%Vendor%
+DriverVer=11/05/2026,1.0.0.0
+
+[DestinationDirs]
+; 10 is the Windows folder; WDM drivers live in SYSTEM32\DRIVERS on Windows 98
+DefaultDestDir=10,SYSTEM32\DRIVERS
+
+[SourceDisksNames]
+1=%DiskName%,,0
+
+[SourceDisksFiles]
+sgl98.sys=1
+
+[Manufacturer]
+%Vendor%=Standard
+
+[Standard]
+%DeviceDesc%=SglInstall,PCI\VEN_1AF4&DEV_1110
+
+[SglInstall]
+CopyFiles=SglFiles
+AddReg=SglAddReg
+
+[SglFiles]
+sgl98.sys
+
+[SglAddReg]
+HKR,,DevLoader,,*ntkern
+HKR,,NTMPDriver,,sgl98.sys
+
+[Strings]
+Vendor="SharedGL"
+DiskName="SharedGL for Windows 98"
+DeviceDesc="SharedGL shared memory device"

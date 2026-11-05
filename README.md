@@ -2,9 +2,9 @@
 
 > **This branch is meant to be used with [qemu-xp-3d](https://github.com/roberttorok/qemu-xp-3d).** Windows hosts need a patched QEMU (the `ivshmem-win` device).
 
-Extends [SharedGL](https://github.com/dmaivel/sharedgl) to **Windows XP guests** and **Windows hosts**, and makes the Windows client faster and more robust. Direct3D 8/9 games on XP run on the host GPU through [WineD3D](https://github.com/JHRobotics/wine9x).
+Extends [SharedGL](https://github.com/dmaivel/sharedgl) to **Windows XP and Windows 98 SE guests** and **Windows hosts**, and makes the Windows client faster and more robust. Direct3D 8/9 games on XP run on the host GPU through [WineD3D](https://github.com/JHRobotics/wine9x); Glide games on Windows 98 through [OpenGLide](https://github.com/voyageur/openglide).
 
-Tested: FIFA 2004, GTA III, NBA Live 2001 demo, 3DMark 2001 SE (24,586 points); XP SP3 guest, RTX 3070, Linux and Windows 11 hosts.
+Tested: FIFA 2004, GTA III, 3DMark 2001 SE (24,586 points); XP SP3 guest, RTX 3070, Linux and Windows 11 hosts. FIFA: Road to World Cup 98 and World Cup 98 (Glide, through OpenGLide); Windows 98 SE guest, Windows 11 host.
 
 Each change is a separate commit, in order of importance.
 
@@ -18,10 +18,16 @@ Each change is a separate commit, in order of importance.
    - `sgldrv.sys` maps the QXL display memory write-back instead of uncached: each frame's blit gets about 10× cheaper on AMD hosts (`sglrenderer -q` turns it off).
    - Connects in `wglCreateContext`, not at DLL load, because GDI loads `opengl32.dll` into processes that never draw.
    - 16-bit display mode requests become 32-bit, because QEMU shows 16-bit QXL modes wrongly.
-2. **Windows hosts.** The server builds and runs on Windows. Shared memory is the named file mapping `Local\sharedgl_shared_memory`. QEMU for Windows has no ivshmem memory backend, so it needs the `ivshmem-win` device from qemu-xp-3d.
-3. **Faster streaming buffer maps.** WineD3D maps vertex buffers hundreds of times per frame, each a round trip. Write-only maps now use a client-side copy and send only changed blocks; invalidated maps need no reply; large replies come in one piece.
-4. **Pixel buffer objects and missing functions:** pack/unpack buffer offsets, `glReadPixels`, `glDrawPixels`, `glGetCompressedTexImage`, `glGetBufferSubData`, `glSamplerParameter{i,f,Ii,Iui}v`.
-5. **Debugging and measurement aids** (off by default): see the tables below, plus command traces and logging of failed shader compiles and links.
+2. **Windows 98 SE guests.** The XP client, built with `SGL_WIN98` as well (see below).
+   - `kernel/win98/sgl98.sys`: WDM driver for ivshmem, with INF, loaded by NTKERN. Windows 98 has no device interfaces for applications and no `\Device\PhysicalMemory`, so the device is opened as `\\.\SGL98` and the memory is mapped once with `MmMapIoSpace`, at an address valid in every process. Those pages aren't reachable from ring 3 on Windows 98 (all 16384 needed it), so the driver sets the U/S bit in the page tables.
+   - Imports only functions Windows 98 has: no SetupAPI device lookup, `AddVectoredExceptionHandler` looked up at run time, no `FILE_APPEND_DATA` for the log.
+   - The display-mode hook is left out: the 16-bit problem is QXL's, and Windows 98's `user32` is shared by all processes.
+   - The frame limiter keeps a fixed schedule and sleeps only until shortly before each frame, because Windows 98 wakes from `Sleep()` several ms late; otherwise 60 fps became about 47 and games timed by frames ran slow.
+   - Needs QEMU's `ivshmem-win` with `bar64=off`: Windows 98 can't use a 64-bit BAR.
+3. **Windows hosts.** The server builds and runs on Windows. Shared memory is the named file mapping `Local\sharedgl_shared_memory`. QEMU for Windows has no ivshmem memory backend, so it needs the `ivshmem-win` device from qemu-xp-3d.
+4. **Faster streaming buffer maps.** WineD3D maps vertex buffers hundreds of times per frame, each a round trip. Write-only maps now use a client-side copy and send only changed blocks; invalidated maps need no reply; large replies come in one piece.
+5. **Pixel buffer objects and missing functions:** pack/unpack buffer offsets, `glReadPixels`, `glDrawPixels`, `glGetCompressedTexImage`, `glGetBufferSubData`, `glSamplerParameter{i,f,Ii,Iui}v`.
+6. **Debugging and measurement aids** (off by default): see the tables below, plus command traces and logging of failed shader compiles and links.
 
 ### Fixed
 
@@ -39,6 +45,7 @@ Each change is a separate commit, in order of importance.
 2. The client spins briefly, then sleeps while waiting for the server (`SGL_WAIT_MODE=original`: the old loop).
 3. Windows clients map shared memory write-back instead of write-combined (write-combined reads are uncached), find the device by interface class (works on XP), and fail cleanly with no server. **Affects Windows 10 guests too; untested there.**
 4. `inc/lzav.h` uses LF line endings.
+5. The crash logger (`SGL_STATS`) looks up `AddVectoredExceptionHandler` at run time, on XP too, so that the same code loads on Windows 98.
 
 ### New server options
 
@@ -46,6 +53,7 @@ Each change is a separate commit, in order of importance.
 |---|---|
 | `-f FPS` | Frame cap for XP clients, `0` = none. Default 60. Read by the client from shared memory every frame |
 | `-q` | Leave XP's QXL display memory uncached |
+| `-s NAME` | Windows hosts: the shared memory's name (default `Local\sharedgl_shared_memory`), so that each VM can have its own server. Give `ivshmem-win` the same name |
 
 ### New environment variables
 
@@ -96,7 +104,24 @@ gcc -O2 -std=gnu17 -w -DSDL_MAIN_HANDLED -Iinc src/server/context.c src/server/d
     -o sglrenderer.exe -lSDL2 -lepoxy -lws2_32 -lwinmm -liphlpapi
 ```
 
+```sh
+# Windows 98 client and driver: as for XP, with these differences (qemu-9x-3d's Makefile does all of this)
+CFLAGS98="-std=gnu17 -march=pentium2 -mtune=generic -mfpmath=387 -mstackrealign -O2 -s -w -D_WIN32_WINNT=0x0410 -DWINVER=0x0410 \
+    -D__USE_MINGW_ANSI_STDIO=0 -Iinc -DSGL_XP -DSGL_WIN98 -DSGL_NO_NETWORK"
+# compile the same files with $CFLAGS98, then link without -lsetupapi:
+$CC -shared -s -o opengl32.dll winmain.o pb.o spinlock.o glimpl.o scratch.o windrv.o \
+    -Wl,--kill-at -Wl,--export-all-symbols -static-libgcc -lgdi32 -luser32 -lwinmm
+# the driver defines its own memcpy and memset: NTKERN may not export them
+$CC -std=gnu17 -O2 -s -march=pentium2 -w -ffreestanding -fno-tree-loop-distribute-patterns -fno-stack-protector \
+    -fno-stack-check -fno-aggressive-loop-optimizations -fno-asynchronous-unwind-tables -D_X86_=1 -I/mingw32/include/ddk \
+    -shared -nostdlib -nostartfiles -o sgl98.sys kernel/win98/sgl98.c \
+    -Wl,--subsystem,native:4.0 -Wl,--major-os-version,4,--minor-os-version,10 -Wl,--entry,_DriverEntry@8 \
+    -Wl,--enable-reloc-section -Wl,--image-base,0x10000 -Wl,--disable-nxcompat -Wl,--disable-dynamicbase \
+    -lntoskrnl -lhal
+```
+
 - **XP install:** put `sgldrv.sys`, `sgldrv.inf` and `sglinstall.exe` in one folder, run `sglinstall.exe`, and copy `opengl32.dll` next to the game's executable.
+- **Windows 98 install:** Windows finds the ivshmem card as "PCI standard RAM Controller"; in Device Manager, update its driver from the folder with `sgl98.sys` and `sgl98.inf`. Copy `opengl32.dll` next to the game's executable. Windows 98 installs made on other emulators may have no PCI bus at first; qemu-9x-3d's README says how to add it.
 - **MSYS2:** the driver's `-I` is `/mingw32/include/ddk`. Add `-std=gnu17` to every command (GCC defaults to C23, which this code doesn't compile as), and `-D__USE_MINGW_ANSI_STDIO=0` to `CFLAGS` so the client uses XP's own `printf`.
 
 ---

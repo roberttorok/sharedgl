@@ -658,6 +658,8 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
     size_t map_length = 0;
     void *download_target = NULL;
     size_t download_offset = 0;
+    /* bytes readable at download_target; SIZE_MAX when not known (named buffer maps) */
+    size_t download_size = 0;
     ENetAddress address = {0};
     ENetHost *server;
     char *shared_exec = NULL;
@@ -920,6 +922,13 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
             }
             case SGL_CMD_VP_DOWNLOAD: {
                 int length = *pb++;
+                /* a reply without a matching read, or past its end, must not take the server down */
+                if (download_target == NULL || length < 0 || download_offset > download_size ||
+                    (size_t)length > download_size - download_offset) {
+                    PRINT_LOG("download of %d bytes at offset %zu rejected: %zu bytes available at %p\n",
+                              length, download_offset, download_size, download_target);
+                    break;
+                }
                 memcpy(p + SGL_OFFSET_REGISTER_RETVAL_V, download_target + download_offset, length);
                 download_offset += length;
                 break;
@@ -929,6 +938,12 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 /* Clients hold SWAP_BUFFERS_SYNC until they have copied the
                  * reply. Never borrow the FIFO: another client can submit
                  * there as soon as we have copied its command buffer. */
+                if (download_target == NULL || download_offset > download_size ||
+                    (size_t)length > download_size - download_offset) {
+                    PRINT_LOG("bulk download of %u bytes at offset %zu rejected: %zu bytes available at %p\n",
+                              length, download_offset, download_size, download_target);
+                    break;
+                }
                 if (net_ctx == NULL && length <= framebuffer_size) {
                     size_t offset = *(uint64_t*)((char*)shared + SGL_OFFSET_REGISTER_FBSTART);
                     memmove((char*)shared + offset, (char*)download_target + download_offset, length);
@@ -1242,6 +1257,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 glGetTexImage(target, level, format, type, scratch_buffer_get(total_size));
                 download_offset = 0;
                 download_target = scratch_buffer_get(total_size);
+                download_size = (size_t)(total_size);
                 break;
             }
             case SGL_CMD_GETCOMPRESSEDTEXIMAGE: {
@@ -1256,6 +1272,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 glGetCompressedTexImage(target, level, scratch_buffer_get(total_size ? total_size : 1));
                 download_offset = 0;
                 download_target = scratch_buffer_get(total_size ? total_size : 1);
+                download_size = (size_t)(total_size ? total_size : 1);
                 break;
             }
             case SGL_CMD_READPIXELS: {
@@ -1274,6 +1291,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 glReadPixels(x, y, width, height, format, type, scratch_buffer_get(total_size ? total_size : 1));
                 download_offset = 0;
                 download_target = scratch_buffer_get(total_size ? total_size : 1);
+                download_size = (size_t)(total_size ? total_size : 1);
                 break;
             }
             case SGL_CMD_DRAWPIXELS: {
@@ -1291,6 +1309,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 glGetBufferSubData(target, offset, size, scratch_buffer_get(size ? size : 1));
                 download_offset = 0;
                 download_target = scratch_buffer_get(size ? size : 1);
+                download_size = (size_t)(size ? size : 1);
                 break;
             }
             case SGL_CMD_VP_OFFSET:
@@ -2949,6 +2968,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 map_buffer = NULL;
                 map_length = 0;
                 download_target = NULL;
+                download_size = 0;
                 break;
             }
             case SGL_CMD_BLENDEQUATIONSEPARATE: {
@@ -5459,6 +5479,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 }
                 download_offset = 0;
                 download_target = map_buffer;
+                download_size = map_length ? map_length : (map_buffer ? SIZE_MAX : 0);
                 break;
             }
             case SGL_CMD_MAPBUFFERRANGE: {
@@ -5472,6 +5493,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                     PRINT_LOG("map failed: target %x offset %d length %d access %x\n", target, offset, length, access);
                 download_offset = 0;
                 download_target = map_buffer;
+                download_size = map_length ? map_length : (map_buffer ? SIZE_MAX : 0);
                 break;
             }
             case SGL_CMD_FENCESYNC: {
@@ -6197,6 +6219,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 map_buffer = glMapNamedBuffer(target, access);
                 download_offset = 0;
                 download_target = map_buffer;
+                download_size = map_buffer ? SIZE_MAX : 0; /* size not known here */
                 break;
             }
             case SGL_CMD_MAPNAMEDBUFFERRANGE: {
@@ -6207,6 +6230,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 map_buffer = glMapNamedBufferRange(target, offset, length, access);
                 download_offset = 0;
                 download_target = map_buffer;
+                download_size = map_buffer && length > 0 ? (size_t)length : 0;
                 break;
             }
             case SGL_CMD_GETNAMEDBUFFERPARAMETERIV: {
@@ -6718,6 +6742,7 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 }
                 download_offset = 0;
                 download_target = map_buffer;
+                download_size = map_length ? map_length : (map_buffer ? SIZE_MAX : 0);
                 break;
             }
             case SGL_CMD_PROGRAMSTRINGARB: {

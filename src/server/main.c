@@ -32,7 +32,7 @@ static int *internal_cmd_ptr;
 extern char sgl_last_draw[];
 
 static const char *usage =
-    "usage: sglrenderer [-h] [-v] [-o] [-n] [-x] [-q] [-g MAJOR.MINOR] [-r WIDTHxHEIGHT] [-m SIZE] [-p PORT] [-f FPS]\n"
+    "usage: sglrenderer [-h] [-v] [-o] [-n] [-x] [-q] [-g MAJOR.MINOR] [-r WIDTHxHEIGHT] [-m SIZE] [-p PORT] [-f FPS] [-s NAME]\n"
     "\n"
     "options:\n"
     "    -h                 display help information\n"
@@ -45,7 +45,9 @@ static const char *usage =
     "    -m [SIZE]          max amount of megabytes program may allocate (default: 32mib)\n"
     "    -p [PORT]          if networking is enabled, specify which port to use (default: 3000)\n"
     "    -f [FPS]           frame rate limit for Windows XP clients, 0 = none (default: %d)\n"
-    "    -q                 Windows XP: leave the QXL display memory uncached (slower blits)\n";
+    "    -q                 Windows XP: leave the QXL display memory uncached (slower blits)\n"
+    "    -s [NAME]          Windows hosts: the shared memory's name, so that each VM can have its own\n"
+    "                       server; give ivshmem-win the same name (default: " SGL_WIN32_MAPPING_NAME ")\n";
 
 static void generate_virtual_machine_arguments(size_t m)
 {
@@ -125,6 +127,7 @@ int main(int argc, char **argv)
 
     int fps_cap = SGL_FPS_CAP_DEFAULT;
     int guest_flags = 0;
+    const char *mapping_name = NULL;
 
     shm_size = 32;
 
@@ -186,6 +189,10 @@ int main(int argc, char **argv)
         case 'q':
             guest_flags |= SGL_GUEST_NO_QXL_CACHE;
             break;
+        case 's':
+            mapping_name = argv[i + 1];
+            i++;
+            break;
         default:
             PRINT_LOG("unrecognized command-line option '%s'\n", argv[i]);
         }
@@ -216,7 +223,7 @@ int main(int argc, char **argv)
         /* A mapping lives as long as a process holds it, so there is nothing to unlink. */
         HANDLE mapping = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE | SEC_COMMIT,
             (DWORD)((unsigned long long)shm_size >> 32), (DWORD)shm_size,
-            network_over_shared ? NULL : SGL_WIN32_MAPPING_NAME);
+            network_over_shared ? NULL : mapping_name ? mapping_name : SGL_WIN32_MAPPING_NAME);
         if (mapping == NULL) {
             PRINT_LOG("failed to create shared memory (error %lu)\n", GetLastError());
             return -1;

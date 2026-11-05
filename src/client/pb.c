@@ -10,14 +10,18 @@
 #include <sys/mman.h>
 #else
 #include <windows.h>
+#ifndef SGL_WIN98
 #include <setupapi.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <malloc.h>
 
 #include <initguid.h>
 
+#ifndef SGL_WIN98
 #pragma comment (lib, "Setupapi.lib")
+#endif
 
 DEFINE_GUID(GUID_DEVINTERFACE_IVSHMEM,
     0xdf576976, 0x569d, 0x4672, 0x95, 0xa0, 0xf5, 0x7e, 0x4e, 0xa0, 0xb2, 0x10);
@@ -132,17 +136,22 @@ void pb_set(int fd, bool direct_access)
     }
 }
 #else
-bool pb_set(bool direct_access)
+#ifdef SGL_WIN98
+/*
+ * Windows 98 has no device interfaces for applications, so sgl98.sys
+ * (kernel/win98) makes a \DosDevices\SGL98 link that CreateFile opens by name.
+ */
+static HANDLE pb_open_device(void)
+{
+    return CreateFileA("\\\\.\\SGL98", 0, 0, NULL, OPEN_EXISTING, 0, 0);
+}
+#else
+static HANDLE pb_open_device(void)
 {
     HDEVINFO device_info;
     PSP_DEVICE_INTERFACE_DETAIL_DATA_A inf_data;
     SP_DEVICE_INTERFACE_DATA dev_data;
-    DWORD64 size;
-    int fifo_size;
-    struct ivshmem_mmap_config config;
-    struct ivshmem_mmap map;
     DWORD request_size = 0;
-    DWORD returned = 0;
     HANDLE handle;
 
     /*
@@ -151,20 +160,20 @@ bool pb_set(bool direct_access)
      */
     device_info = SetupDiGetClassDevsA(&GUID_DEVINTERFACE_IVSHMEM, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
     if (device_info == INVALID_HANDLE_VALUE)
-        return false;
+        return INVALID_HANDLE_VALUE;
 
     ZeroMemory(&dev_data, sizeof(SP_DEVICE_INTERFACE_DATA));
     dev_data.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
     if (SetupDiEnumDeviceInterfaces(device_info, NULL, &GUID_DEVINTERFACE_IVSHMEM, 0, &dev_data) == FALSE) {
         SetupDiDestroyDeviceInfoList(device_info);
-        return false;
+        return INVALID_HANDLE_VALUE;
     }
 
     SetupDiGetDeviceInterfaceDetailA(device_info, &dev_data, NULL, 0, &request_size, NULL);
     if (!request_size) {
         SetupDiDestroyDeviceInfoList(device_info);
-        return false;
+        return INVALID_HANDLE_VALUE;
     }
 
     inf_data = (PSP_DEVICE_INTERFACE_DETAIL_DATA_A)malloc(request_size);
@@ -173,12 +182,26 @@ bool pb_set(bool direct_access)
     if (!SetupDiGetDeviceInterfaceDetailA(device_info, &dev_data, inf_data, request_size, NULL, NULL)) {
         free(inf_data);
         SetupDiDestroyDeviceInfoList(device_info);
-        return false;
+        return INVALID_HANDLE_VALUE;
     }
 
     handle = CreateFileA(inf_data->DevicePath, 0, 0, NULL, OPEN_EXISTING, 0, 0);
     free(inf_data);
     SetupDiDestroyDeviceInfoList(device_info);
+    return handle;
+}
+#endif
+
+bool pb_set(bool direct_access)
+{
+    DWORD64 size;
+    int fifo_size;
+    struct ivshmem_mmap_config config;
+    struct ivshmem_mmap map;
+    DWORD returned = 0;
+    HANDLE handle;
+
+    handle = pb_open_device();
     if (handle == INVALID_HANDLE_VALUE)
         return false;
 
@@ -202,6 +225,15 @@ bool pb_set(bool direct_access)
     ivshmem_handle = handle;
     ptr = map.pointer;
 
+#ifdef SGL_WIN98
+    /* sgl98.sys makes the mapping reachable from ring 3; if that failed, say so rather than crash */
+    if (ptr == NULL || IsBadWritePtr(ptr, 4096)) {
+        pb_unset();
+        ptr = NULL;
+        return false;
+    }
+#endif
+
     /* the server publishes these at startup and clears them when it exits */
     if (*(volatile uint64_t*)((char*)ptr + SGL_OFFSET_REGISTER_MEMSIZE) == 0 ||
         *(volatile int*)((char*)ptr + SGL_OFFSET_REGISTER_FIFO_SIZE) <= 0) {
@@ -216,10 +248,12 @@ bool pb_set(bool direct_access)
      * SglCacheQxl() there); an older sgldrv.sys rejects the request and nothing
      * changes. The host can turn this off (sglrenderer -q).
      */
+#ifndef SGL_WIN98 /* no QXL driver for Windows 98 */
     if (!(*(volatile int*)((char*)ptr + SGL_OFFSET_REGISTER_GUEST_FLAGS) & SGL_GUEST_NO_QXL_CACHE)) {
         ULONG result[4];
         DeviceIoControl(handle, IOCTL_SGL_CACHE_QXL, NULL, 0, result, sizeof(result), &returned, NULL);
     }
+#endif
 
     base = (PVOID)((uintptr_t)map.pointer + (uintptr_t)SGL_STAGE_OFFSET);
     fifo_size = *(int*)((char*)ptr + SGL_OFFSET_REGISTER_FIFO_SIZE);

@@ -39,7 +39,14 @@ static void xpwgl_log(const char *message)
     if (length == 0)
         return;
     strcat(path, "sharedgl.log");
+#ifdef SGL_WIN98
+    /* Windows 9x has no FILE_APPEND_DATA access right */
+    file = CreateFileA(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+    if (file != INVALID_HANDLE_VALUE)
+        SetFilePointer(file, 0, NULL, FILE_END);
+#else
     file = CreateFileA(path, FILE_APPEND_DATA, FILE_SHARE_READ, NULL, OPEN_ALWAYS, 0, NULL);
+#endif
     if (file != INVALID_HANDLE_VALUE) {
         WriteFile(file, message, (DWORD)strlen(message), &written, NULL);
         WriteFile(file, "\r\n", 2, &written, NULL);
@@ -264,6 +271,30 @@ static void xpwgl_pace(void)
         return;
     }
 
+#ifdef SGL_WIN98
+    /*
+     * Windows 98 wakes from Sleep() several ms late, even with timeBeginPeriod(1).
+     * Starting the next period from the late wake-up added that lateness to every
+     * frame: 60 fps became about 47, and games that run their logic per frame (FIFA 98)
+     * ran in slow motion. So sleep only until a few ms before the deadline, yield for
+     * the rest, and keep the schedule: the next deadline is one period after this one,
+     * not after whenever this thread woke. A frame more than a period behind re-syncs.
+     */
+    for (;;) {
+        LONGLONG remaining_ms;
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart >= next.QuadPart)
+            break;
+        remaining_ms = (next.QuadPart - now.QuadPart) * 1000 / frequency.QuadPart;
+        if (remaining_ms > 4)
+            Sleep((DWORD)remaining_ms - 4);
+        else
+            Sleep(0);
+    }
+    next.QuadPart += period;
+    if (now.QuadPart >= next.QuadPart)
+        next.QuadPart = now.QuadPart + period;
+#else
     for (;;) {
         LONGLONG remaining_ms;
         QueryPerformanceCounter(&now);
@@ -276,6 +307,7 @@ static void xpwgl_pace(void)
             spin_pause();
     }
     next.QuadPart = now.QuadPart + period;
+#endif
 }
 
 static BOOL xp_present(HDC hdc)
@@ -431,8 +463,13 @@ static LONG WINAPI xpwgl_crash_logger(PEXCEPTION_POINTERS info)
 static void xpwgl_install_crash_logger(void)
 {
     char value[8] = "";
-    if (GetEnvironmentVariableA("SGL_STATS", value, sizeof(value)) > 0)
-        AddVectoredExceptionHandler(1, xpwgl_crash_logger);
+    if (GetEnvironmentVariableA("SGL_STATS", value, sizeof(value)) > 0) {
+        /* XP and later only: looked up so that the DLL still loads on Windows 98 */
+        typedef PVOID (WINAPI *add_handler_t)(ULONG, PVECTORED_EXCEPTION_HANDLER);
+        add_handler_t add = (add_handler_t)GetProcAddress(GetModuleHandleA("kernel32.dll"), "AddVectoredExceptionHandler");
+        if (add != NULL)
+            add(1, xpwgl_crash_logger);
+    }
 }
 
 /*
@@ -504,6 +541,13 @@ static void *xpwgl_hot_patch(void *target, void *hook)
 
 void windrv_install_display_hook(void)
 {
+#ifdef SGL_WIN98
+    /*
+     * The 16-bit problem is the XP QXL driver's. And on Windows 9x user32 lives in
+     * the shared arena, so patching it would change it for every process.
+     */
+    return;
+#endif
     char value[8] = "";
     HMODULE user32 = LoadLibraryA("user32.dll");
 
