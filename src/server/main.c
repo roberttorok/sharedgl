@@ -12,10 +12,10 @@
 #include <fcntl.h>
 #include <signal.h>
 
+/* The QEMU device ivshmem-win opens this same name (Windows hosts; also named in the -h text). */
+#define SGL_WIN32_MAPPING_NAME "Local\\" SGL_SHARED_MEMORY_NAME
 #ifdef _WIN32
 #include <windows.h>
-/* The QEMU device ivshmem-win opens this same name. */
-#define SGL_WIN32_MAPPING_NAME "Local\\" SGL_SHARED_MEMORY_NAME
 #else
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -46,8 +46,9 @@ static const char *usage =
     "    -p [PORT]          if networking is enabled, specify which port to use (default: 3000)\n"
     "    -f [FPS]           frame rate limit for Windows XP clients, 0 = none (default: %d)\n"
     "    -q                 Windows XP: leave the QXL display memory uncached (slower blits)\n"
-    "    -s [NAME]          Windows hosts: the shared memory's name, so that each VM can have its own\n"
-    "                       server; give ivshmem-win the same name (default: " SGL_WIN32_MAPPING_NAME ")\n";
+    "    -s [NAME]          the shared memory's name, so that each VM can have its own server; Windows:\n"
+    "                       give ivshmem-win the same name (default: " SGL_WIN32_MAPPING_NAME "); Linux: the\n"
+    "                       file /dev/shm/NAME for memory-backend-file (default: " SGL_SHARED_MEMORY_NAME ")\n";
 
 static void generate_virtual_machine_arguments(size_t m)
 {
@@ -149,9 +150,9 @@ int main(int argc, char **argv)
             break;
         case 'x':
 #ifndef _WIN32
-            shm_unlink(SGL_SHARED_MEMORY_NAME);
+            shm_unlink(mapping_name ? mapping_name : SGL_SHARED_MEMORY_NAME);
 #endif
-            PRINT_LOG("unlinked shared memory '%s'\n", SGL_SHARED_MEMORY_NAME);
+            PRINT_LOG("unlinked shared memory '%s'\n", mapping_name ? mapping_name : SGL_SHARED_MEMORY_NAME);
             return 0;
         case 'g':
             major = argv[i + 1][0] - '0';
@@ -236,9 +237,11 @@ int main(int argc, char **argv)
     }
 #else
     if (!network_over_shared) {
-        int shm_fd = shm_open(SGL_SHARED_MEMORY_NAME, O_CREAT | O_RDWR, S_IRWXU);
+        /* -s gives each VM its own /dev/shm file; QEMU's memory-backend-file uses the same name. */
+        const char *shm_name = mapping_name ? mapping_name : SGL_SHARED_MEMORY_NAME;
+        int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, S_IRWXU);
         if (shm_fd == -1) {
-            PRINT_LOG("failed to open shared memory '%s'\n", SGL_SHARED_MEMORY_NAME);
+            PRINT_LOG("failed to open shared memory '%s'\n", shm_name);
             return -1;
         }
 
