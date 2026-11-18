@@ -24,6 +24,9 @@ sgl98.sys=1
 
 [Standard]
 %DeviceDesc%=SglInstall,PCI\VEN_1AF4&DEV_1110
+; The same device when QEMU gives it 3dfx Voodoo2 IDs (vm.sh VOODOO=1), so that game
+; setup programs that look for a 3dfx card find one.
+%DeviceDescV2%=SglInstall,PCI\VEN_121A&DEV_0002
 
 [SglInstall]
 CopyFiles=SglFiles
@@ -40,3 +43,4 @@ HKR,,NTMPDriver,,sgl98.sys
 Vendor="SharedGL"
 DiskName="SharedGL for Windows 98"
 DeviceDesc="SharedGL shared memory device"
+DeviceDescV2="SharedGL shared memory device (3dfx Voodoo2 ID)"

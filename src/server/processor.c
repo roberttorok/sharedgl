@@ -1566,6 +1566,23 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 //// printf("glColorPointer(0x%x, 0x%x, %d, [%f, %f, %f, %f, %f, %f, ...]);\n", size, type, stride, ((float*)uploaded)[0], ((float*)uploaded)[1], ((float*)uploaded)[2], ((float*)uploaded)[3], ((float*)uploaded)[4], ((float*)uploaded)[5]);
                 break;
             }
+            case SGL_CMD_SECONDARYCOLORPOINTER: {
+                int size = *pb++,
+                    type = *pb++,
+                    stride = *pb++,
+                    use_upload = *pb++;
+                int64_t offs = pb_next_i64(&pb);
+                glSecondaryColorPointer(size, type, stride, use_upload ? uploaded : (const void*)(uintptr_t)offs);
+                break;
+            }
+            case SGL_CMD_FOGCOORDPOINTER: {
+                int type = *pb++,
+                    stride = *pb++,
+                    use_upload = *pb++;
+                int64_t offs = pb_next_i64(&pb);
+                glFogCoordPointer(type, stride, use_upload ? uploaded : (const void*)(uintptr_t)offs);
+                break;
+            }
             case SGL_CMD_NORMALPOINTER: {
                 int type = *pb++,
                     stride = *pb++,
@@ -6824,11 +6841,54 @@ void sgl_cmd_processor_start(struct sgl_cmd_processor_args args)
                 prof_times[cmd] += now - prof_mark;
                 prof_mark = now;
             }
+            /*
+             * Commands between glBegin and glEnd: GL reports an illegal one only at glEnd, so keep
+             * the list to show which command it was.
+             */
+            static int be_cmds[48], be_count, be_dumps;
+            if (cmd == SGL_CMD_BEGIN)
+                be_count = 0;
+            if ((begun || cmd == SGL_CMD_END) && be_count < 48)
+                be_cmds[be_count++] = cmd;
+
             if (!begun) {
                 int error;
+                /*
+                 * The same error from the same command can repeat thousands of times per second
+                 * (tens of MB of log, and virus scanners rescanning the file): print it once,
+                 * then a count every 5 seconds.
+                 */
+                static int last_error = -1, last_cmd = -1;
+                static unsigned repeats;
+                static time_t repeat_since;
                 /* With no current context, NVIDIA on Windows reports an error from glGetError forever. */
-                while (SDL_GL_GetCurrentContext() != NULL && (error = glGetError()) != GL_NO_ERROR)
-                    PRINT_LOG("gl error (%d / 0x%04x) on client %d from %s (%d)\n", error, error, client_id, sgl_cmd2str(cmd), cmd);
+                while (SDL_GL_GetCurrentContext() != NULL && (error = glGetError()) != GL_NO_ERROR) {
+                    time_t now = time(NULL);
+                    if (error == last_error && cmd == last_cmd) {
+                        repeats++;
+                        if (now - repeat_since >= 5) {
+                            PRINT_LOG("gl error (%d / 0x%04x) from %s: %u more times\n", error, error, sgl_cmd2str(cmd), repeats);
+                            repeats = 0;
+                            repeat_since = now;
+                        }
+                    } else {
+                        if (repeats)
+                            PRINT_LOG("gl error (%d / 0x%04x) from %s: %u more times\n", last_error, last_error, sgl_cmd2str(last_cmd), repeats);
+                        PRINT_LOG("gl error (%d / 0x%04x) on client %d from %s (%d)\n", error, error, client_id, sgl_cmd2str(cmd), cmd);
+                        last_error = error;
+                        last_cmd = cmd;
+                        repeats = 0;
+                        repeat_since = now;
+                    }
+                    if (cmd == SGL_CMD_END && be_dumps < 5) {
+                        be_dumps++;
+                        PRINT_LOG("  commands since glBegin (%d%s):", be_count, be_count == 48 ? ", first 48" : "");
+                        for (int i = 0; i < be_count; i++)
+                            fprintf(stdout, " %s", sgl_cmd2str(be_cmds[i]));
+                        fprintf(stdout, "\n");
+                        fflush(stdout);
+                    }
+                }
             }
             if (profile) prof_errors += SDL_GetPerformanceCounter() - prof_mark;
             if (sgl_frameprof_on) {

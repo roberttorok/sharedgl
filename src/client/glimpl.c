@@ -1357,6 +1357,33 @@ static inline void glimpl_push_client_pointers(int first, int count)
         pb_push(GL_TEXTURE0 + glimpl_client_active_texture);
     }
 
+    /*
+     * Secondary colour and fog coordinate arrays (OpenGLide's vertex array path uses both).
+     * Without these the server had the arrays enabled but no pointer for them.
+     */
+    if (glimpl_color2_ptr.in_use) {
+        bool status = glimpl_push_client_pointer(glimpl_color2_ptr.client_managed, first, count, glimpl_color2_ptr.size,
+                            glimpl_color2_ptr.type, glimpl_color2_ptr.stride, glimpl_color2_ptr.pointer);
+
+        pb_push(SGL_CMD_SECONDARYCOLORPOINTER);
+        pb_push(glimpl_color2_ptr.size);
+        pb_push(glimpl_color2_ptr.type);
+        pb_push(status ? 0 : glimpl_color2_ptr.stride);
+        pb_push(status);
+        pb_push64(status ? 0 : (int64_t)(uintptr_t)glimpl_color2_ptr.pointer);
+    }
+
+    if (glimpl_fog_coord_pointer.in_use) {
+        bool status = glimpl_push_client_pointer(glimpl_fog_coord_pointer.client_managed, first, count, 1,
+                            glimpl_fog_coord_pointer.type, glimpl_fog_coord_pointer.stride, glimpl_fog_coord_pointer.pointer);
+
+        pb_push(SGL_CMD_FOGCOORDPOINTER);
+        pb_push(glimpl_fog_coord_pointer.type);
+        pb_push(status ? 0 : glimpl_fog_coord_pointer.stride);
+        pb_push(status);
+        pb_push64(status ? 0 : (int64_t)(uintptr_t)glimpl_fog_coord_pointer.pointer);
+    }
+
     if (glimpl_vertex_ptr.in_use) {
         bool status = glimpl_push_client_pointer(glimpl_vertex_ptr.client_managed, first, count, glimpl_vertex_ptr.size,
                             glimpl_vertex_ptr.type,  glimpl_vertex_ptr.stride, glimpl_vertex_ptr.pointer);
@@ -1381,6 +1408,10 @@ static bool glimpl_has_client_managed_draw_state(void)
     if (glimpl_color_ptr.in_use && glimpl_color_ptr.client_managed)
         return true;
     if (glimpl_vertex_ptr.in_use && glimpl_vertex_ptr.client_managed)
+        return true;
+    if (glimpl_color2_ptr.in_use && glimpl_color2_ptr.client_managed)
+        return true;
+    if (glimpl_fog_coord_pointer.in_use && glimpl_fog_coord_pointer.client_managed)
         return true;
 
     for (int i = 0; i < GLIMPL_MAX_TEXTURES; i++)
@@ -3118,7 +3149,8 @@ void glFogCoordPointer(GLenum type, GLsizei stride, const void* pointer)
         .type = type,
         .stride = stride,
         .pointer = pointer,
-        .in_use = glimpl_fog_coord_pointer.in_use
+        .in_use = glimpl_fog_coord_pointer.in_use,
+        .client_managed = glimpl_array_buffer_binding == 0
     };
 }
 
@@ -3129,7 +3161,8 @@ void glSecondaryColorPointer(GLint size, GLenum type, GLsizei stride, const void
         .type = type,
         .stride = stride,
         .pointer = pointer,
-        .in_use = glimpl_color2_ptr.in_use
+        .in_use = glimpl_color2_ptr.in_use,
+        .client_managed = glimpl_array_buffer_binding == 0
     };
 }
 
@@ -4355,10 +4388,97 @@ GLboolean glIsTexture(GLuint texture)
     return pb_read(SGL_OFFSET_REGISTER_RETVAL);
 }
 
+/*
+ * glArrayElement reads the client's vertex arrays, which live in the guest: the server only gets them
+ * when a glDraw* call uploads them. Sending just the index made the host driver read guest addresses
+ * (Quake 3 crashed the server this way). So do what the spec defines glArrayElement to be: the
+ * immediate-mode calls for element i, with the data read here.
+ */
+static void glimpl_array_fetch(const void *base, GLenum type, GLint size, GLsizei stride, GLint i, bool normalize, float *out)
+{
+    static const int type_size[] = { 1, 1, 2, 2, 4, 4, 4 }; /* GL_BYTE .. GL_FLOAT */
+    int ts = (type == GL_DOUBLE) ? 8 : (type >= GL_BYTE && type <= GL_FLOAT) ? type_size[type - GL_BYTE] : 4;
+    const char *p = (const char*)base + (size_t)i * (stride ? stride : size * ts);
+
+    for (int c = 0; c < size; c++) {
+        switch (type) {
+        case GL_BYTE:           out[c] = normalize ? (2.0f * ((const GLbyte*)p)[c] + 1.0f) / 255.0f : ((const GLbyte*)p)[c]; break;
+        case GL_UNSIGNED_BYTE:  out[c] = normalize ? ((const GLubyte*)p)[c] / 255.0f : ((const GLubyte*)p)[c]; break;
+        case GL_SHORT:          out[c] = normalize ? (2.0f * ((const GLshort*)p)[c] + 1.0f) / 65535.0f : ((const GLshort*)p)[c]; break;
+        case GL_UNSIGNED_SHORT: out[c] = normalize ? ((const GLushort*)p)[c] / 65535.0f : ((const GLushort*)p)[c]; break;
+        case GL_INT:            out[c] = normalize ? (float)((2.0 * ((const GLint*)p)[c] + 1.0) / 4294967295.0) : (float)((const GLint*)p)[c]; break;
+        case GL_UNSIGNED_INT:   out[c] = normalize ? (float)(((const GLuint*)p)[c] / 4294967295.0) : (float)((const GLuint*)p)[c]; break;
+        case GL_DOUBLE:         out[c] = (float)((const GLdouble*)p)[c]; break;
+        default:                out[c] = ((const GLfloat*)p)[c]; break;
+        }
+    }
+}
+
+void glMultiTexCoord4f(GLenum target, GLfloat s, GLfloat t, GLfloat r, GLfloat q);
+void glSecondaryColor3f(GLfloat red, GLfloat green, GLfloat blue);
+void glFogCoordf(GLfloat coord);
+
 void glArrayElement(GLint i)
 {
-    pb_push(SGL_CMD_ARRAYELEMENT);
-    pb_push(i);
+    bool all_client = !(glimpl_normal_ptr.in_use && !glimpl_normal_ptr.client_managed)
+                   && !(glimpl_color_ptr.in_use && !glimpl_color_ptr.client_managed)
+                   && !(glimpl_vertex_ptr.in_use && !glimpl_vertex_ptr.client_managed)
+                   && !(glimpl_color2_ptr.in_use && !glimpl_color2_ptr.client_managed)
+                   && !(glimpl_fog_coord_pointer.in_use && !glimpl_fog_coord_pointer.client_managed);
+    for (int t = 0; t < GLIMPL_MAX_TEXTURES; t++)
+        if (glimpl_tex_coord_ptr[t].in_use && !glimpl_tex_coord_ptr[t].client_managed)
+            all_client = false;
+
+    if (!all_client) {
+        /* Arrays in buffer objects: the server can read those itself. */
+        pb_push(SGL_CMD_ARRAYELEMENT);
+        pb_push(i);
+        return;
+    }
+
+    float v[4];
+
+    if (glimpl_normal_ptr.in_use && glimpl_normal_ptr.pointer) {
+        glimpl_array_fetch(glimpl_normal_ptr.pointer, glimpl_normal_ptr.type, 3, glimpl_normal_ptr.stride, i, true, v);
+        glNormal3f(v[0], v[1], v[2]);
+    }
+
+    if (glimpl_color_ptr.in_use && glimpl_color_ptr.pointer) {
+        int n = (int)glimpl_get_legacy_color_array_size(glimpl_color_ptr.size);
+        v[3] = 1.0f;
+        glimpl_array_fetch(glimpl_color_ptr.pointer, glimpl_color_ptr.type, n, glimpl_color_ptr.stride, i, true, v);
+        if (glimpl_color_ptr.size == GL_BGRA) { float r = v[2]; v[2] = v[0]; v[0] = r; }
+        glColor4f(v[0], v[1], v[2], v[3]);
+    }
+
+    if (glimpl_color2_ptr.in_use && glimpl_color2_ptr.pointer) {
+        glimpl_array_fetch(glimpl_color2_ptr.pointer, glimpl_color2_ptr.type, 3, glimpl_color2_ptr.stride, i, true, v);
+        glSecondaryColor3f(v[0], v[1], v[2]);
+    }
+
+    if (glimpl_fog_coord_pointer.in_use && glimpl_fog_coord_pointer.pointer) {
+        glimpl_array_fetch(glimpl_fog_coord_pointer.pointer, glimpl_fog_coord_pointer.type, 1, glimpl_fog_coord_pointer.stride, i, false, v);
+        glFogCoordf(v[0]);
+    }
+
+    for (int t = 0; t < GLIMPL_MAX_TEXTURES; t++) {
+        struct gl_color_tex_vertex_pointer *tc = &glimpl_tex_coord_ptr[t];
+        if (!tc->in_use || !tc->pointer)
+            continue;
+        v[0] = 0.0f; v[1] = 0.0f; v[2] = 0.0f; v[3] = 1.0f;
+        glimpl_array_fetch(tc->pointer, tc->type, tc->size, tc->stride, i, false, v);
+        if (t == 0)
+            glTexCoord4f(v[0], v[1], v[2], v[3]);
+        else
+            glMultiTexCoord4f(GL_TEXTURE0 + t, v[0], v[1], v[2], v[3]);
+    }
+
+    /* The vertex comes last: it is the call that emits the vertex. */
+    if (glimpl_vertex_ptr.in_use && glimpl_vertex_ptr.pointer) {
+        v[0] = 0.0f; v[1] = 0.0f; v[2] = 0.0f; v[3] = 1.0f;
+        glimpl_array_fetch(glimpl_vertex_ptr.pointer, glimpl_vertex_ptr.type, glimpl_vertex_ptr.size, glimpl_vertex_ptr.stride, i, false, v);
+        glVertex4f(v[0], v[1], v[2], v[3]);
+    }
 }
 
 void glDisableClientState(GLenum array)
@@ -4375,6 +4495,12 @@ void glDisableClientState(GLenum array)
         break;
     case GL_VERTEX_ARRAY:
         glimpl_vertex_ptr.in_use = false;
+        break;
+    case GL_SECONDARY_COLOR_ARRAY:
+        glimpl_color2_ptr.in_use = false;
+        break;
+    case GL_FOG_COORD_ARRAY:
+        glimpl_fog_coord_pointer.in_use = false;
         break;
     }
 
@@ -4396,6 +4522,12 @@ void glEnableClientState(GLenum array)
         break;
     case GL_VERTEX_ARRAY:
         glimpl_vertex_ptr.in_use = true;
+        break;
+    case GL_SECONDARY_COLOR_ARRAY:
+        glimpl_color2_ptr.in_use = true;
+        break;
+    case GL_FOG_COORD_ARRAY:
+        glimpl_fog_coord_pointer.in_use = true;
         break;
     }
 
